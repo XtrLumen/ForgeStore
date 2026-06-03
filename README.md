@@ -20,3 +20,7 @@ Each line: a key-value pair.
 
 `package` — app package name
 `mode` — `generate`, `patch`, or empty for auto-detect
+
+## Credits
+
+[RaPLT](https://github.com/Dere3046/RaPLT)
