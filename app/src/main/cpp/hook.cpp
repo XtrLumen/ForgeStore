@@ -160,6 +160,7 @@ status_t BinderStub::onTransact(uint32_t code, const Parcel &data,
         post_req.writeUint32(flags);
         post_req.writeInt32(info.uid);
         post_req.writeInt32(info.pid);
+        post_req.writeUint64(data.dataSize());
         post_req.appendFrom(&data, 0, data.dataSize());
 
         size_t reply_sz = reply ? reply->dataSize() : 0;
