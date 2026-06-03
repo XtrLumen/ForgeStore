@@ -37,17 +37,16 @@ open class BinderInterceptor : Binder() {
     ): TransactionResult = TransactionResult.Skip
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+        val txId = data.readLong()
         return when (code) {
-            PRE_CODE -> handlePreTransact(data, reply)
-            POST_CODE -> handlePostTransact(data, reply)
+            PRE_CODE -> handlePreTransact(txId, data, reply)
+            POST_CODE -> handlePostTransact(txId, data, reply)
             else -> super.onTransact(code, data, reply, flags)
         }
     }
 
-    private fun handlePreTransact(data: Parcel, reply: Parcel?): Boolean {
+    private fun handlePreTransact(txId: Long, data: Parcel, reply: Parcel?): Boolean {
         try {
-            data.enforceInterface(DUMMY_DESCRIPTOR)
-            val txId = data.readLong()
             val target = data.readStrongBinder()
             val txCode = data.readInt()
             val txFlags = data.readInt()
@@ -79,10 +78,8 @@ open class BinderInterceptor : Binder() {
         return true
     }
 
-    private fun handlePostTransact(data: Parcel, reply: Parcel?): Boolean {
+    private fun handlePostTransact(txId: Long, data: Parcel, reply: Parcel?): Boolean {
         try {
-            data.enforceInterface(DUMMY_DESCRIPTOR)
-            val txId = data.readLong()
             val target = data.readStrongBinder()
             val txCode = data.readInt()
             val txFlags = data.readInt()
@@ -126,8 +123,6 @@ open class BinderInterceptor : Binder() {
     }
 
     companion object {
-        private const val DUMMY_DESCRIPTOR = "com.dere3046.forgemint.BinderInterceptor"
-
         val BACKDOOR_CODE = 0xfeedface.toInt()
         const val REGISTER_CODE = 1
         const val UNREGISTER_CODE = 2
