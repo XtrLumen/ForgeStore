@@ -20,19 +20,43 @@ class Keystore2Interceptor : BinderInterceptor() {
         callingPid: Int,
         data: Parcel,
     ): TransactionResult {
+        if (shouldSkip(callingUid)) {
+            return TransactionResult.ContinueAndSkipPost
+        }
         if (code == GET_KEY_ENTRY_TRANSACTION) {
             return handleGetKeyEntry(data, callingUid)
         }
         if (code == DELETE_KEY_TRANSACTION) {
             return handleDeleteKey(data, callingUid)
         }
-        if (shouldSkip(callingUid)) {
-            return TransactionResult.ContinueAndSkipPost
+        if (code == UPDATE_SUBCOMPONENT_TRANSACTION) {
+            return handleUpdateSubcomponent(data, callingUid)
         }
         if (code == LIST_ENTRIES_TRANSACTION || code == LIST_ENTRIES_BATCHED_TRANSACTION) {
             if (isGms(callingUid)) return TransactionResult.ContinueAndSkipPost
         }
         return TransactionResult.Continue
+    }
+
+    private fun handleUpdateSubcomponent(data: Parcel, uid: Int): TransactionResult {
+        try {
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
+            val entry = StateManager.lookupByNspace(uid, descriptor.nspace)
+                ?: return TransactionResult.ContinueAndSkipPost
+
+            val publicCert = data.createByteArray()
+            val certificateChain = data.createByteArray()
+
+            entry.metadata.certificate = publicCert
+            entry.metadata.certificateChain = certificateChain
+            Logger.i("updateSubcomponent nspace=${entry.nspace} cert=${publicCert?.size} chain=${certificateChain?.size}")
+
+            val reply = Parcel.obtain()
+            reply.writeNoException()
+            return TransactionResult.OverrideReply(reply)
+        } catch (_: Exception) {}
+        return TransactionResult.ContinueAndSkipPost
     }
 
     override fun onPostTransact(
@@ -239,6 +263,7 @@ class Keystore2Interceptor : BinderInterceptor() {
         val LIST_ENTRIES_BATCHED_TRANSACTION: Int by lazy { resolveCode("TRANSACTION_listEntriesBatched") }
         val GET_KEY_ENTRY_TRANSACTION: Int by lazy { resolveCode("TRANSACTION_getKeyEntry") }
         val DELETE_KEY_TRANSACTION: Int by lazy { resolveCode("TRANSACTION_deleteKey") }
+        val UPDATE_SUBCOMPONENT_TRANSACTION: Int by lazy { resolveCode("TRANSACTION_updateSubcomponent") }
 
         private fun resolveCode(name: String): Int {
             return try {

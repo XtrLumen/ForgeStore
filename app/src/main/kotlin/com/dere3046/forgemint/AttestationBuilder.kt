@@ -311,7 +311,11 @@ object AttestationBuilder {
             m.invoke(null, "ro.boot.avb_modules_hash", "") as String
         } catch (_: Exception) { "" }
         if (value.isNotEmpty()) return hexStringToByteArray(value)
-        return ByteArray(32) { (it * 5 + 1).toByte() }
+        return randomBytes(32)
+    }
+
+    private fun randomBytes(size: Int): ByteArray {
+        return java.security.SecureRandom().run { ByteArray(size).also { nextBytes(it) } }
     }
 
     private fun initBootKey(): ByteArray {
@@ -321,7 +325,7 @@ object AttestationBuilder {
             m.invoke(null, "ro.boot.vbmeta.public_key_digest", "") as String
         } catch (_: Exception) { "" }
         if (value.isNotEmpty() && value.length >= 64) return hexStringToByteArray(value)
-        return ByteArray(32) { (it * 7 + 3).toByte() }
+        return randomBytes(32)
     }
 
     private fun initBootHash(): ByteArray {
@@ -331,7 +335,7 @@ object AttestationBuilder {
             m.invoke(null, "ro.boot.vbmeta.digest", "") as String
         } catch (_: Exception) { "" }
         if (value.isNotEmpty() && value.length >= 64) return hexStringToByteArray(value)
-        return ByteArray(32) { (it * 11 + 5).toByte() }
+        return randomBytes(32)
     }
 
     private fun hexStringToByteArray(s: String): ByteArray {
