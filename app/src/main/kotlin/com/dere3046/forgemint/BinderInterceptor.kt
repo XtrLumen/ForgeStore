@@ -12,6 +12,7 @@ open class BinderInterceptor : Binder() {
         data object Continue : TransactionResult()
         data class OverrideReply(val parcel: Parcel) : TransactionResult()
         data object ContinueAndSkipPost : TransactionResult()
+        data class OverrideData(val data: Parcel) : TransactionResult()
     }
 
     open fun onPreTransact(
@@ -71,6 +72,12 @@ open class BinderInterceptor : Binder() {
                     reply.writeInt(0)
                     reply.writeLong(result.parcel.dataSize().toLong())
                     reply.appendFrom(result.parcel, 0, result.parcel.dataSize())
+                }
+                is TransactionResult.OverrideData -> {
+                    reply.writeInt(ACTION_OVERRIDE_DATA)
+                    reply.writeLong(result.data.dataSize().toLong())
+                    reply.appendFrom(result.data, 0, result.data.dataSize())
+                    result.data.recycle()
                 }
                 is TransactionResult.ContinueAndSkipPost -> reply.writeInt(ACTION_SKIP_POST)
             }
@@ -141,6 +148,7 @@ open class BinderInterceptor : Binder() {
         const val ACTION_CONTINUE = 1
         const val ACTION_OVERRIDE_REPLY = 2
         const val ACTION_SKIP_POST = 3
+        const val ACTION_OVERRIDE_DATA = 4
 
         fun getBackdoor(binder: IBinder): IBinder? {
             val data = Parcel.obtain()

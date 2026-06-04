@@ -28,6 +28,7 @@ using namespace android;
 #define ACTION_CONTINUE         1
 #define ACTION_OVERRIDE_REPLY   2
 #define ACTION_SKIP_POST        3
+#define ACTION_OVERRIDE_DATA    4
 
 static int (*g_orig_ioctl)(int, int, ...);
 
@@ -124,6 +125,9 @@ status_t BinderStub::onTransact(uint32_t code, const Parcel &data,
     sp<BBinder> real_target = info.target;
     sp<IBinder> callback = info.callback;
 
+    Parcel final_data;
+    bool use_modified_data = false;
+
     Parcel pre_req, pre_resp;
     pre_req.writeInt64(info.tx_id);
     pre_req.writeStrongBinder(real_target);
@@ -150,9 +154,15 @@ status_t BinderStub::onTransact(uint32_t code, const Parcel &data,
             return OK;
         if (action == ACTION_SKIP_POST)
             cb_status = (status_t)-1;
+        if (action == ACTION_OVERRIDE_DATA) {
+            size_t sz = pre_resp.readUint64();
+            final_data.appendFrom(&pre_resp, pre_resp.dataPosition(), sz);
+            use_modified_data = true;
+        }
     }
 
-    status_t result = real_target->transact(info.code, data, reply, flags);
+    status_t result = real_target->transact(info.code,
+        use_modified_data ? final_data : data, reply, flags);
 
     if (cb_status != (status_t)-1 && callback && result == OK) {
         Parcel post_req, post_resp;
@@ -162,8 +172,9 @@ status_t BinderStub::onTransact(uint32_t code, const Parcel &data,
         post_req.writeUint32(flags);
         post_req.writeInt32(info.uid);
         post_req.writeInt32(info.pid);
-        post_req.writeUint64(data.dataSize());
-        post_req.appendFrom(&data, 0, data.dataSize());
+        const Parcel &post_data = use_modified_data ? final_data : data;
+        post_req.writeUint64(post_data.dataSize());
+        post_req.appendFrom(&post_data, 0, post_data.dataSize());
 
         size_t reply_sz = reply ? reply->dataSize() : 0;
         post_req.writeUint64(reply_sz);
