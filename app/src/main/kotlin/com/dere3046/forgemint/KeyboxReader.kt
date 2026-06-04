@@ -13,6 +13,7 @@ import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.security.interfaces.ECPrivateKey
 import java.security.interfaces.RSAPrivateKey
+import java.util.concurrent.ConcurrentHashMap
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 
@@ -20,7 +21,7 @@ object KeyboxReader {
 
     private const val KEYBOX_FILE = "/data/adb/forgemint/keybox.xml"
 
-    private var keyboxCache: Map<String, CertificateBuilder.KeyboxData>? = null
+    private var keyboxCache: ConcurrentHashMap<String, CertificateBuilder.KeyboxData>? = null
 
     fun loadKeybox(algorithm: Int? = null): CertificateBuilder.KeyboxData? {
         val algoKey = algorithm?.let { algoToKey(it) } ?: return singleKey()
@@ -38,11 +39,11 @@ object KeyboxReader {
         return cache.values.firstOrNull()
     }
 
-    private fun reload(): Map<String, CertificateBuilder.KeyboxData> {
+    private fun reload(): ConcurrentHashMap<String, CertificateBuilder.KeyboxData> {
         val file = File(KEYBOX_FILE)
         if (!file.exists()) {
             Logger.w("Keybox file not found: $KEYBOX_FILE")
-            return emptyMap()
+            return ConcurrentHashMap()
         }
         return try {
             val xmlContent = file.readText().trimStart('\uFEFF', '\uFFFE', ' ')
@@ -51,14 +52,14 @@ object KeyboxReader {
             map
         } catch (e: Exception) {
             Logger.e("Failed to load keybox", e)
-            emptyMap()
+            ConcurrentHashMap()
         }
     }
 
     fun clearCache() { keyboxCache = null }
 
-    private fun parseXml(xmlContent: String): Map<String, CertificateBuilder.KeyboxData> {
-        val found = mutableMapOf<String, CertificateBuilder.KeyboxData>()
+    private fun parseXml(xmlContent: String): ConcurrentHashMap<String, CertificateBuilder.KeyboxData> {
+        val found = ConcurrentHashMap<String, CertificateBuilder.KeyboxData>()
         val parser = XmlPullParserFactory.newInstance().newPullParser().apply {
             setInput(StringReader(xmlContent))
         }
