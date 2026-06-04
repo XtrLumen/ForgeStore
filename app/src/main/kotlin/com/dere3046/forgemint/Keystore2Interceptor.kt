@@ -223,7 +223,7 @@ class Keystore2Interceptor : BinderInterceptor() {
                 kd.alias?.let { existing.putIfAbsent(it, kd) }
             }
 
-            val generated = StateManager.listForUid(uid)
+            val generated = StateManager.listForUid(uid).take(100)
             for (gk in generated) {
                 existing[gk.alias] = KeyDescriptor().apply {
                     domain = Domain.APP

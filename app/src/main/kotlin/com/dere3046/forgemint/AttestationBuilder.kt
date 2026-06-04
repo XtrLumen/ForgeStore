@@ -79,19 +79,19 @@ object AttestationBuilder {
             ASN1Integer(osVersion.toLong()),
         )
 
-        val osPatch = getPatchLevel()
+        val osPatch = getPatchLevel(uid)
         props[AttestationConstants.TAG_OS_PATCHLEVEL] = DERTaggedObject(
             true, AttestationConstants.TAG_OS_PATCHLEVEL,
             ASN1Integer(osPatch.toLong()),
         )
 
-        val vendorPatch = getPatchLevelLong()
+        val vendorPatch = getPatchLevelLong(uid)
         props[AttestationConstants.TAG_VENDOR_PATCHLEVEL] = DERTaggedObject(
             true, AttestationConstants.TAG_VENDOR_PATCHLEVEL,
             ASN1Integer(vendorPatch.toLong()),
         )
 
-        val bootPatch = getPatchLevelLong()
+        val bootPatch = getPatchLevelLong(uid)
         props[AttestationConstants.TAG_BOOT_PATCHLEVEL] = DERTaggedObject(
             true, AttestationConstants.TAG_BOOT_PATCHLEVEL,
             ASN1Integer(bootPatch.toLong()),
@@ -100,7 +100,10 @@ object AttestationBuilder {
         return props
     }
 
-    fun getPatchLevel(): Int {
+    fun getPatchLevel(uid: Int): Int {
+        val custom = ConfigManager.getPatchLevelForUid(uid)
+        val value = custom?.system ?: custom?.all
+        if (value != null) return value
         val patch = Build.VERSION.SECURITY_PATCH ?: "2026-06"
         val parts = patch.split("-")
         if (parts.size == 2) {
@@ -111,7 +114,10 @@ object AttestationBuilder {
         return 26206
     }
 
-    fun getPatchLevelLong(): Int {
+    fun getPatchLevelLong(uid: Int): Int {
+        val custom = ConfigManager.getPatchLevelForUid(uid)
+        val value = custom?.vendor ?: custom?.boot ?: custom?.all
+        if (value != null) return value
         val patch = Build.VERSION.SECURITY_PATCH ?: "2026-06-01"
         val digits = patch.replace("-", "")
         return digits.take(8).toIntOrNull() ?: 20260601

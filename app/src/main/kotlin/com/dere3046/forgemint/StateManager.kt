@@ -50,5 +50,12 @@ object StateManager {
         patchedChains[keyId] = chain
     }
 
+    fun clearAll() {
+        val count = cache.size
+        cache.clear()
+        patchedChains.clear()
+        Logger.i("Cleared all state ($count entries)")
+    }
+
     private fun key(uid: Int, alias: String) = "$uid:$alias"
 }

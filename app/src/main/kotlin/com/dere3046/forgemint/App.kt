@@ -12,8 +12,11 @@ object App {
 
     private const val KEYSTORE_SERVICE = "android.system.keystore2.IKeystoreService/default"
     private const val RETRY_DELAY_MS = 1000L
+    private const val MAX_RETRIES = 5
 
     private lateinit var modDir: String
+    private var retryCount = 0
+    private var injectionAttempted = false
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -31,15 +34,20 @@ object App {
             try {
                 val ksBinder = ServiceManager.getService(KEYSTORE_SERVICE)
                 if (ksBinder == null) {
+                    checkRetryLimit()
                     Thread.sleep(RETRY_DELAY_MS)
                     continue
                 }
                 ksBinder.linkToDeath({ onServiceDeath() }, 0)
 
-                if (connectInterceptor(ksBinder)) break
+                if (connectInterceptor(ksBinder)) {
+                    retryCount = 0
+                    break
+                }
             } catch (e: Exception) {
                 Logger.e("Connection attempt failed", e)
             }
+            checkRetryLimit()
             Thread.sleep(RETRY_DELAY_MS)
         }
 
@@ -88,10 +96,13 @@ object App {
             return true
         }
 
-        Logger.i("Backdoor not found, attempting injection")
-        if (!performInjection()) {
-            Logger.w("Injection failed, will retry")
-            return false
+        if (!injectionAttempted) {
+            Logger.i("Backdoor not found, attempting injection")
+            injectionAttempted = true
+            if (!performInjection()) {
+                Logger.w("Injection failed, will retry")
+                return false
+            }
         }
 
         Thread.sleep(500)
@@ -103,6 +114,14 @@ object App {
 
         Logger.w("Injection succeeded but backdoor still not available")
         return false
+    }
+
+    private fun checkRetryLimit() {
+        retryCount++
+        if (retryCount >= MAX_RETRIES) {
+            Logger.e("Failed after $MAX_RETRIES retries, exiting")
+            kotlin.system.exitProcess(1)
+        }
     }
 
     private fun performInjection(): Boolean {

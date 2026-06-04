@@ -1,6 +1,5 @@
 package com.dere3046.forgemint
 
-import android.os.Build
 import android.os.FileObserver
 import android.os.ServiceManager
 import java.io.File
@@ -10,16 +9,28 @@ object ConfigManager {
 
     enum class Mode { GENERATE, PATCH, AUTO }
 
+    data class CustomPatchLevel(
+        val system: Int?,
+        val vendor: Int?,
+        val boot: Int?,
+        val all: Int?,
+    )
+
     private const val CONFIG_DIR = "/data/adb/forgemint"
     private const val TARGET_FILE = "target.txt"
     private const val TEE_STATUS_FILE = "tee_status.txt"
+    private const val PATCH_FILE = "security_patch.txt"
+    private const val KEYBOX_FILE = "keybox.xml"
 
     private val configRoot = File(CONFIG_DIR)
     private val targetFile = File(configRoot, TARGET_FILE)
     private val teeStatusFile = File(configRoot, TEE_STATUS_FILE)
+    private val patchFile = File(configRoot, PATCH_FILE)
+    private val keyboxFile = File(configRoot, KEYBOX_FILE)
 
     @Volatile private var packageModes = mapOf<String, Mode>()
     @Volatile private var isTeBroken: Boolean? = null
+    @Volatile private var patchLevelConfigs = mapOf<String, CustomPatchLevel>()
     private val uidPackageCache = ConcurrentHashMap<Int, List<String>>()
 
     private var observer: FileObserver? = null
@@ -28,9 +39,10 @@ object ConfigManager {
         configRoot.mkdirs()
         Logger.i("Config root: ${configRoot.absolutePath}")
         loadTargetPackages()
+        loadSecurityPatchLevels()
         loadTeeStatus()
         startObserver()
-        Logger.i("Config initialized: ${packageModes.size} packages")
+        Logger.i("Config initialized: ${packageModes.size} packages, ${patchLevelConfigs.size} patch configs")
     }
 
     fun shouldGenerate(uid: Int): Boolean = getModeForUid(uid) == Mode.GENERATE ||
@@ -41,8 +53,29 @@ object ConfigManager {
 
     fun shouldSkip(uid: Int): Boolean = getModeForUid(uid) == null
 
+    fun getPatchLevelForUid(uid: Int): CustomPatchLevel? {
+        val packages = uidPackageCache[uid] ?: getPackagesForUid(uid)
+        for (pkg in packages) {
+            patchLevelConfigs[pkg]?.let { return it }
+        }
+        return null
+    }
+
+    fun getPackagesForUid(uid: Int): List<String> {
+        return uidPackageCache.getOrPut(uid) {
+            try {
+                val pmBinder = ServiceManager.getService("package") ?: return@getOrPut emptyList()
+                val pm = android.content.pm.IPackageManager.Stub.asInterface(pmBinder)
+                pm.getPackagesForUid(uid)?.toList() ?: emptyList()
+            } catch (e: Exception) {
+                Logger.w("Failed to get packages for UID $uid", e)
+                emptyList()
+            }
+        }
+    }
+
     private fun getModeForUid(uid: Int): Mode? {
-        val packages = getPackagesForUid(uid)
+        val packages = uidPackageCache[uid] ?: getPackagesForUid(uid)
         if (packages.isEmpty()) return null
         if (isTeBroken == null) loadTeeStatus()
         for (pkg in packages) {
@@ -83,6 +116,58 @@ object ConfigManager {
         }
     }
 
+    private fun loadSecurityPatchLevels() {
+        if (!patchFile.exists()) return
+        try {
+            val configs = mutableMapOf<String, CustomPatchLevel>()
+            var currentPkg: String? = null
+            var currentSystem: Int? = null
+            var currentVendor: Int? = null
+            var currentBoot: Int? = null
+            var currentAll: Int? = null
+
+            for (line in patchFile.readLines()) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
+                if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                    if (currentPkg != null && (currentSystem != null || currentVendor != null || currentBoot != null || currentAll != null)) {
+                        configs[currentPkg] = CustomPatchLevel(currentSystem, currentVendor, currentBoot, currentAll)
+                    }
+                    currentPkg = trimmed.removeSurrounding("[", "]").trim()
+                    currentSystem = null; currentVendor = null; currentBoot = null; currentAll = null
+                    continue
+                }
+                val eqIdx = trimmed.indexOf('=')
+                if (eqIdx < 0 || currentPkg == null) continue
+                val key = trimmed.substring(0, eqIdx).trim().lowercase()
+                val value = trimmed.substring(eqIdx + 1).trim()
+                val parsed = parsePatchValue(value)
+                when (key) {
+                    "system" -> currentSystem = parsed
+                    "vendor" -> currentVendor = parsed
+                    "boot" -> currentBoot = parsed
+                    "all" -> currentAll = parsed
+                }
+            }
+            if (currentPkg != null && (currentSystem != null || currentVendor != null || currentBoot != null || currentAll != null)) {
+                configs[currentPkg] = CustomPatchLevel(currentSystem, currentVendor, currentBoot, currentAll)
+            }
+            patchLevelConfigs = configs
+            Logger.i("Loaded ${configs.size} patch level configs")
+        } catch (e: Exception) {
+            Logger.e("Failed to load $PATCH_FILE", e)
+        }
+    }
+
+    private fun parsePatchValue(value: String): Int {
+        val digits = value.replace("-", "")
+        return when (digits.length) {
+            8 -> digits.take(8).toIntOrNull() ?: 0
+            6 -> "${digits.take(6)}01".toIntOrNull() ?: 0
+            else -> 0
+        }
+    }
+
     fun checkTeeStatus() {
         isTeBroken = try {
             val result = TeeChecker.isTeeFunctional()
@@ -101,19 +186,6 @@ object ConfigManager {
         } else null
     }
 
-    private fun getPackagesForUid(uid: Int): List<String> {
-        return uidPackageCache.getOrPut(uid) {
-            try {
-                val pmBinder = ServiceManager.getService("package") ?: return@getOrPut emptyList()
-                val pm = android.content.pm.IPackageManager.Stub.asInterface(pmBinder)
-                pm.getPackagesForUid(uid)?.toList() ?: emptyList()
-            } catch (e: Exception) {
-                Logger.w("Failed to get packages for UID $uid", e)
-                emptyList()
-            }
-        }
-    }
-
     private fun startObserver() {
         observer?.stopWatching()
         observer = object : FileObserver(configRoot, CLOSE_WRITE or MOVED_TO) {
@@ -124,6 +196,15 @@ object ConfigManager {
                 }
                 if (path == TEE_STATUS_FILE) {
                     loadTeeStatus()
+                }
+                if (path == PATCH_FILE) {
+                    Logger.i("security_patch.txt changed, reloading")
+                    loadSecurityPatchLevels()
+                }
+                if (path == KEYBOX_FILE) {
+                    Logger.i("keybox.xml changed, clearing caches")
+                    KeyboxReader.clearCache()
+                    StateManager.clearAll()
                 }
             }
         }.apply { startWatching() }

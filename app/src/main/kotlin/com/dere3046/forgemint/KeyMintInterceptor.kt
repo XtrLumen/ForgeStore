@@ -270,9 +270,9 @@ class KeyMintInterceptor(
         }
         addAuth(Tag.ORIGIN, securityLevel) { origin = params.origin ?: KeyOrigin.GENERATED }
         addAuth(Tag.OS_VERSION, securityLevel) { integer = AttestationBuilder.osVersion }
-        addAuth(Tag.OS_PATCHLEVEL, securityLevel) { integer = AttestationBuilder.getPatchLevel() }
-        addAuth(Tag.VENDOR_PATCHLEVEL, securityLevel) { integer = AttestationBuilder.getPatchLevelLong() }
-        addAuth(Tag.BOOT_PATCHLEVEL, securityLevel) { integer = AttestationBuilder.getPatchLevelLong() }
+        addAuth(Tag.OS_PATCHLEVEL, securityLevel) { integer = AttestationBuilder.getPatchLevel(callingUid) }
+        addAuth(Tag.VENDOR_PATCHLEVEL, securityLevel) { integer = AttestationBuilder.getPatchLevelLong(callingUid) }
+        addAuth(Tag.BOOT_PATCHLEVEL, securityLevel) { integer = AttestationBuilder.getPatchLevelLong(callingUid) }
         addAuth(Tag.CREATION_DATETIME, securityLevel) { dateTime = System.currentTimeMillis() }
         addAuth(Tag.USER_ID, SecurityLevel.SOFTWARE) { integer = callingUid / 100000 }
 
