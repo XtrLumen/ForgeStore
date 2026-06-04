@@ -10,7 +10,10 @@ public class KeyParameter implements Parcelable {
     public static final Parcelable.Creator<KeyParameter> CREATOR =
             new Parcelable.Creator<>() {
                 public KeyParameter createFromParcel(Parcel in) {
-                    return new KeyParameter();
+                    KeyParameter kp = new KeyParameter();
+                    kp.tag = in.readInt();
+                    kp.value = KeyParameterValue.CREATOR.createFromParcel(in);
+                    return kp;
                 }
                 public KeyParameter[] newArray(int size) {
                     return new KeyParameter[size];
