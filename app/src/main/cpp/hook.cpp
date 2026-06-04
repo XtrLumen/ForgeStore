@@ -3,6 +3,7 @@
 #include "raplt.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
 #include <linux/android/binder.h>
@@ -28,7 +29,7 @@ using namespace android;
 #define ACTION_OVERRIDE_REPLY   2
 #define ACTION_SKIP_POST        3
 
-static int (*g_orig_ioctl)(int, unsigned long, void *);
+static int (*g_orig_ioctl)(int, int, ...);
 
 struct ThreadTxInfo {
     uint64_t tx_id;
@@ -188,8 +189,13 @@ status_t BinderStub::onTransact(uint32_t code, const Parcel &data,
     return result;
 }
 
-static int hooked_ioctl(int fd, unsigned long request, void *arg)
+static int hooked_ioctl(int fd, int request, ...)
 {
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+
     if (!g_stub_ready)
         return g_orig_ioctl(fd, request, arg);
 
@@ -197,12 +203,12 @@ static int hooked_ioctl(int fd, unsigned long request, void *arg)
     if (ret < 0 || request != BINDER_WRITE_READ || !arg) return ret;
 
     auto *bwr = (struct binder_write_read *)arg;
-    if (bwr->read_consumed == 0) return ret;
+    if (bwr->read_size == 0 || bwr->read_consumed == 0 || !bwr->read_buffer) return ret;
 
     uintptr_t ptr = (uintptr_t)bwr->read_buffer;
     uintptr_t end  = ptr + bwr->read_consumed;
 
-    while (ptr + 4 <= end) {
+    while (ptr + sizeof(uint32_t) <= end) {
         uint32_t cmd = *(uint32_t *)ptr;
         ptr += 4;
         size_t cmd_sz = _IOC_SIZE(cmd);
@@ -215,27 +221,39 @@ static int hooked_ioctl(int fd, unsigned long request, void *arg)
                 : (struct binder_transaction_data *)ptr;
             if (!tr || !tr->target.ptr || !tr->cookie) goto next;
 
-            BBinder *target = (BBinder *)tr->cookie;
-            wp<IBinder> wp_target = target;
-            LOG("BR code=0x%x cookie=%llx uid=%d pid=%d", tr->code, tr->cookie, tr->sender_euid, tr->sender_pid);
-
+            BBinder *target = nullptr;
             bool hijack = false;
             ThreadTxInfo info = {};
             info.tx_id = ++g_tx_id_counter;
-            info.code  = tr->code;
 
-            if (tr->code == BACKDOOR_CODE) {
-                LOG("BACKDOOR matched, hijacking tx_id=%llu", (unsigned long long)info.tx_id);
+            if (tr->code == BACKDOOR_CODE && tr->sender_euid == 0) {
+                LOG("BACKDOOR matched (root), hijacking tx_id=%llu", (unsigned long long)info.tx_id);
                 hijack = true;
+                info.code = BACKDOOR_CODE;
                 info.target = nullptr;
                 info.callback = nullptr;
+            } else if (tr->sender_euid == 0) {
+                tr->sender_euid = 1000;
+                LOG("Spoofed UID 0 → 1000 for code=0x%x", tr->code);
             } else {
-                std::shared_lock lock(g_registry_mutex);
-                auto it = g_registry.find(wp_target);
-                if (it != g_registry.end()) {
-                    info.target   = target;
-                    info.callback = it->second;
-                    hijack = true;
+                RefBase::weakref_type *weak_ref = reinterpret_cast<RefBase::weakref_type *>(tr->target.ptr);
+                if (weak_ref && weak_ref->attemptIncStrong(nullptr)) {
+                    target = reinterpret_cast<BBinder *>(tr->cookie);
+                    wp<IBinder> wp_target = target;
+                    LOG("BR code=0x%x cookie=%llx uid=%d pid=%d", tr->code, (unsigned long long)tr->cookie, tr->sender_euid, tr->sender_pid);
+
+                    {
+                        std::shared_lock lock(g_registry_mutex);
+                        auto it = g_registry.find(wp_target);
+                        if (it != g_registry.end()) {
+                            info.code     = tr->code;
+                            info.target   = target;
+                            info.callback = it->second;
+                            hijack = true;
+                        }
+                    }
+
+                    target->decStrong(nullptr);
                 }
             }
 
