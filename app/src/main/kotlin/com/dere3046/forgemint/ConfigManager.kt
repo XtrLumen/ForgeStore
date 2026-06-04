@@ -30,7 +30,7 @@ object ConfigManager {
 
     @Volatile private var packageModes = mapOf<String, Mode>()
     @Volatile private var isTeBroken: Boolean? = null
-    @Volatile private var patchLevelConfigs = mapOf<String, CustomPatchLevel>()
+    @Volatile private var globalPatchLevel: CustomPatchLevel? = null
     private val uidPackageCache = ConcurrentHashMap<Int, List<String>>()
 
     private var observer: FileObserver? = null
@@ -42,7 +42,7 @@ object ConfigManager {
         loadSecurityPatchLevels()
         loadTeeStatus()
         startObserver()
-        Logger.i("Config initialized: ${packageModes.size} packages, ${patchLevelConfigs.size} patch configs")
+        Logger.i("Config initialized: ${packageModes.size} packages, global patch level: ${globalPatchLevel != null}")
     }
 
     fun shouldGenerate(uid: Int): Boolean = getModeForUid(uid) == Mode.GENERATE ||
@@ -53,13 +53,7 @@ object ConfigManager {
 
     fun shouldSkip(uid: Int): Boolean = getModeForUid(uid) == null
 
-    fun getPatchLevelForUid(uid: Int): CustomPatchLevel? {
-        val packages = uidPackageCache[uid] ?: getPackagesForUid(uid)
-        for (pkg in packages) {
-            patchLevelConfigs[pkg]?.let { return it }
-        }
-        return null
-    }
+    fun getPatchLevelForUid(uid: Int): CustomPatchLevel? = globalPatchLevel
 
     fun getPackagesForUid(uid: Int): List<String> {
         return uidPackageCache.getOrPut(uid) {
@@ -119,41 +113,30 @@ object ConfigManager {
     private fun loadSecurityPatchLevels() {
         if (!patchFile.exists()) return
         try {
-            val configs = mutableMapOf<String, CustomPatchLevel>()
-            var currentPkg: String? = null
-            var currentSystem: Int? = null
-            var currentVendor: Int? = null
-            var currentBoot: Int? = null
-            var currentAll: Int? = null
+            var sys: Int? = null
+            var ven: Int? = null
+            var boo: Int? = null
+            var all: Int? = null
 
             for (line in patchFile.readLines()) {
                 val trimmed = line.trim()
                 if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
-                if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-                    if (currentPkg != null && (currentSystem != null || currentVendor != null || currentBoot != null || currentAll != null)) {
-                        configs[currentPkg] = CustomPatchLevel(currentSystem, currentVendor, currentBoot, currentAll)
-                    }
-                    currentPkg = trimmed.removeSurrounding("[", "]").trim()
-                    currentSystem = null; currentVendor = null; currentBoot = null; currentAll = null
-                    continue
-                }
                 val eqIdx = trimmed.indexOf('=')
-                if (eqIdx < 0 || currentPkg == null) continue
+                if (eqIdx < 0) continue
                 val key = trimmed.substring(0, eqIdx).trim().lowercase()
                 val value = trimmed.substring(eqIdx + 1).trim()
                 val parsed = parsePatchValue(value)
                 when (key) {
-                    "system" -> currentSystem = parsed
-                    "vendor" -> currentVendor = parsed
-                    "boot" -> currentBoot = parsed
-                    "all" -> currentAll = parsed
+                    "system" -> sys = parsed
+                    "vendor" -> ven = parsed
+                    "boot" -> boo = parsed
+                    "all" -> all = parsed
                 }
             }
-            if (currentPkg != null && (currentSystem != null || currentVendor != null || currentBoot != null || currentAll != null)) {
-                configs[currentPkg] = CustomPatchLevel(currentSystem, currentVendor, currentBoot, currentAll)
+            if (sys != null || ven != null || boo != null || all != null) {
+                globalPatchLevel = CustomPatchLevel(sys, ven, boo, all)
+                Logger.i("Loaded global patch level: system=${sys} vendor=${ven} boot=${boo} all=${all}")
             }
-            patchLevelConfigs = configs
-            Logger.i("Loaded ${configs.size} patch level configs")
         } catch (e: Exception) {
             Logger.e("Failed to load $PATCH_FILE", e)
         }
