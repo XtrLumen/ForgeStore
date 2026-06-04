@@ -168,19 +168,25 @@ class KeyMintInterceptor(
         try {
             data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
-            data.createTypedArray(KeyParameter.CREATOR)
-            data.readBoolean()
 
-            val entry = StateManager.lookup(uid, keyDescriptor.alias ?: return TransactionResult.Continue)
-                ?: StateManager.lookupByNspace(uid, keyDescriptor.nspace)
+            if (keyDescriptor.domain != Domain.KEY_ID) {
+                return TransactionResult.ContinueAndSkipPost
+            }
+
+            val entry = StateManager.lookupByNspace(uid, keyDescriptor.nspace)
                 ?: return TransactionResult.Continue
 
-            Logger.i("createOperation for generated key alias=${entry.alias}")
+            val params = data.createTypedArray(KeyParameter.CREATOR) ?: return TransactionResult.Continue
+            val parsedParams = KeyMintAttestation(params)
+            data.readBoolean()
 
-            val operation = SoftwareOperation(entry.keyPair, entry.nspace, entry.alias, uid)
+            Logger.i("createOperation for generated key alias=${entry.alias} nspace=${keyDescriptor.nspace}")
+
+            val operation = SoftwareOperation(txId, entry.keyPair, parsedParams)
+            val binder = SoftwareOperationBinder(operation)
             val override = Parcel.obtain()
             override.writeNoException()
-            override.writeStrongBinder(operation)
+            override.writeStrongBinder(binder)
             return TransactionResult.OverrideReply(override)
         } catch (e: Exception) {
             Logger.e("createOperation failed", e)

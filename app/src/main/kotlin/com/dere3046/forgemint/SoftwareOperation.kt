@@ -1,136 +1,189 @@
 package com.dere3046.forgemint
 
-import android.os.Binder
-import android.os.Parcel
+import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.BlockMode
+import android.hardware.security.keymint.Digest
+import android.hardware.security.keymint.KeyPurpose
+import android.hardware.security.keymint.PaddingMode
+import android.os.RemoteException
+import android.system.keystore2.IKeystoreOperation
 import java.security.KeyPair
 import java.security.Signature
-import java.security.interfaces.ECKey
-import java.security.interfaces.RSAKey
+import java.security.SignatureException
+import javax.crypto.Cipher
+
+private sealed interface CryptoPrimitive {
+    fun update(data: ByteArray?): ByteArray?
+    fun finish(data: ByteArray?, signature: ByteArray?): ByteArray?
+    fun abort()
+}
+
+private object JcaAlgorithmMapper {
+    fun mapSignatureAlgorithm(params: KeyMintAttestation): String {
+        val digest = when (params.digest.firstOrNull()) {
+            Digest.SHA_2_256 -> "SHA256"
+            Digest.SHA_2_384 -> "SHA384"
+            Digest.SHA_2_512 -> "SHA512"
+            else -> "NONE"
+        }
+        val keyAlgo = when (params.algorithm) {
+            Algorithm.EC -> "ECDSA"
+            Algorithm.RSA -> "RSA"
+            else -> throw IllegalArgumentException("Unsupported signature algorithm: ${params.algorithm}")
+        }
+        return "${digest}with${keyAlgo}"
+    }
+
+    fun mapCipherAlgorithm(params: KeyMintAttestation): String {
+        val keyAlgo = when (params.algorithm) {
+            Algorithm.RSA -> "RSA"
+            Algorithm.AES -> "AES"
+            else -> throw IllegalArgumentException("Unsupported cipher algorithm: ${params.algorithm}")
+        }
+        val blockMode = when (params.blockMode.firstOrNull()) {
+            BlockMode.ECB -> "ECB"
+            BlockMode.CBC -> "CBC"
+            BlockMode.GCM -> "GCM"
+            else -> "ECB"
+        }
+        val padding = when (params.padding.firstOrNull()) {
+            PaddingMode.NONE -> "NoPadding"
+            PaddingMode.PKCS7 -> "PKCS7Padding"
+            PaddingMode.RSA_PKCS1_1_5_ENCRYPT -> "PKCS1Padding"
+            PaddingMode.RSA_OAEP -> "OAEPPadding"
+            else -> "NoPadding"
+        }
+        return "$keyAlgo/$blockMode/$padding"
+    }
+}
+
+private class Signer(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
+    private val signature: Signature =
+        Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply {
+            initSign(keyPair.private)
+        }
+
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) signature.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray {
+        if (data != null) update(data)
+        return this.signature.sign()
+    }
+
+    override fun abort() {}
+}
+
+private class Verifier(keyPair: KeyPair, params: KeyMintAttestation) : CryptoPrimitive {
+    private val signature: Signature =
+        Signature.getInstance(JcaAlgorithmMapper.mapSignatureAlgorithm(params)).apply {
+            initVerify(keyPair.public)
+        }
+
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) signature.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        if (data != null) update(data)
+        if (signature == null) throw SignatureException("Signature to verify is null")
+        if (!this.signature.verify(signature)) {
+            throw SignatureException("Signature verification failed")
+        }
+        return null
+    }
+
+    override fun abort() {}
+}
+
+private class CipherPrimitive(
+    keyPair: KeyPair,
+    params: KeyMintAttestation,
+    private val opMode: Int,
+) : CryptoPrimitive {
+    private val cipher: Cipher =
+        Cipher.getInstance(JcaAlgorithmMapper.mapCipherAlgorithm(params)).apply {
+            val key = if (opMode == Cipher.ENCRYPT_MODE) keyPair.public else keyPair.private
+            init(opMode, key)
+        }
+
+    override fun update(data: ByteArray?): ByteArray? =
+        if (data != null) cipher.update(data) else null
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? =
+        if (data != null) cipher.doFinal(data) else cipher.doFinal()
+
+    override fun abort() {}
+}
 
 class SoftwareOperation(
-    private val keyPair: KeyPair,
-    private val nspace: Long,
-    private val alias: String,
-    private val uid: Int,
-    private val params: KeyMintAttestation? = null,
-) : Binder() {
+    private val txId: Long,
+    keyPair: KeyPair,
+    params: KeyMintAttestation,
+) {
+    private val primitive: CryptoPrimitive
 
-    private var canceled = false
-    private var signer: Signature? = null
-    private var finished = false
+    init {
+        val purpose = params.purpose.firstOrNull() ?: throw UnsupportedOperationException("No purpose specified")
+        Logger.d("SoftwareOperation txId=$txId purpose=$purpose")
+        primitive = when (purpose) {
+            KeyPurpose.SIGN -> Signer(keyPair, params)
+            KeyPurpose.VERIFY -> Verifier(keyPair, params)
+            KeyPurpose.ENCRYPT -> CipherPrimitive(keyPair, params, Cipher.ENCRYPT_MODE)
+            KeyPurpose.DECRYPT -> CipherPrimitive(keyPair, params, Cipher.DECRYPT_MODE)
+            else -> throw UnsupportedOperationException("Unsupported operation purpose: $purpose")
+        }
+    }
 
-    override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
-        if (canceled) return false
-        return try {
-            when (code) {
-                UPDATE_OPERATION_CODE -> handleUpdate(data, reply)
-                FINISH_OPERATION_CODE -> handleFinish(data, reply)
-                ABORT_OPERATION_CODE -> handleAbort(reply)
-                UPDATE_AAD_CODE -> handleUpdateAad(data, reply)
-                else -> super.onTransact(code, data, reply, flags)
-            }
+    fun update(data: ByteArray?): ByteArray? {
+        try {
+            return primitive.update(data)
         } catch (e: Exception) {
-            Logger.e("SoftwareOperation error alias=$alias", e)
-            reply?.let { it.writeInt(-38); it.writeString(e.message) }
-            true
+            Logger.e("SoftwareOperation update error txId=$txId", e)
+            throw e
         }
     }
 
-    private fun handleUpdate(data: Parcel, reply: Parcel?): Boolean {
-        val input = readByteArray(data)
-        if (input != null) {
-            val sig = getOrCreateSigner()
-            sig.update(input)
+    fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        try {
+            val result = primitive.finish(data, signature)
+            Logger.i("SoftwareOperation finish txId=$txId OK")
+            return result
+        } catch (e: Exception) {
+            Logger.e("SoftwareOperation finish error txId=$txId", e)
+            throw e
         }
-        reply?.writeInt(0)
-        return true
     }
 
-    private fun handleFinish(data: Parcel, reply: Parcel?): Boolean {
-        val input = readByteArray(data)
-        readByteArray(data) // signature (for verify operations, ignored for sign)
+    fun abort() {
+        primitive.abort()
+        Logger.d("SoftwareOperation abort txId=$txId")
+    }
+}
 
-        if (finished) {
-            reply?.writeInt(0)
-            reply?.writeByteArray(ByteArray(0))
-            return true
-        }
-        finished = true
+class SoftwareOperationBinder(private val operation: SoftwareOperation) :
+    IKeystoreOperation.Stub() {
 
-        val sig = getOrCreateSigner()
-        if (input != null) sig.update(input)
-        val result = sig.sign()
-
-        reply?.writeInt(0)
-        reply?.writeInt(result.size)
-        reply?.writeByteArray(result)
-        return true
+    @Throws(RemoteException::class)
+    override fun update(input: ByteArray?): ByteArray? {
+        return operation.update(input)
     }
 
-    private fun handleAbort(reply: Parcel?): Boolean {
-        canceled = true
-        reply?.writeInt(0)
-        return true
+    @Throws(RemoteException::class)
+    override fun updateAad(input: ByteArray?): Int {
+        return 0
     }
 
-    private fun handleUpdateAad(data: Parcel, reply: Parcel?): Boolean {
-        readByteArray(data)
-        reply?.writeInt(0)
-        return true
+    @Throws(RemoteException::class)
+    override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? {
+        return operation.finish(input, signature)
     }
 
-    private fun getOrCreateSigner(): Signature {
-        if (signer != null) return signer!!
-        val algorithm = getSignatureAlgorithm()
-        val sig = Signature.getInstance(algorithm)
-        sig.initSign(keyPair.private)
-        signer = sig
-        return sig
-    }
-
-    private fun getSignatureAlgorithm(): String {
-        val p = params
-        val digest = if (p != null && p.digest.isNotEmpty()) {
-            when (p.digest.first()) {
-                2 -> "SHA224"
-                3 -> "SHA256"
-                4 -> "SHA384"
-                5 -> "SHA512"
-                else -> "SHA256"
-            }
-        } else "SHA256"
-        val keyAlgo = when (keyPair.private) {
-            is ECKey -> "ECDSA"
-            is RSAKey -> "RSA"
-            else -> "ECDSA"
-        }
-        return "$digest${if (keyAlgo == "ECDSA") "withECDSA" else "withRSA"}"
-    }
-
-    private fun readByteArray(data: Parcel): ByteArray? {
-        val len = data.readInt()
-        if (len < 0) return null
-        val arr = ByteArray(len)
-        data.readByteArray(arr)
-        return arr
-    }
-
-    companion object {
-        val UPDATE_OPERATION_CODE: Int by lazy { resolveCode("TRANSACTION_update") }
-        val FINISH_OPERATION_CODE: Int by lazy { resolveCode("TRANSACTION_finish") }
-        val ABORT_OPERATION_CODE: Int by lazy { resolveCode("TRANSACTION_abort") }
-        val UPDATE_AAD_CODE: Int by lazy { resolveCode("TRANSACTION_updateAad") }
-
-        private fun resolveCode(name: String): Int {
-            return try {
-                android.system.keystore2.IKeystoreOperation.Stub::class.java
-                    .getDeclaredField(name)
-                    .apply { isAccessible = true }
-                    .getInt(null)
-            } catch (e: Exception) {
-                Logger.e("Failed to resolve $name", e)
-                -1
-            }
-        }
+    @Throws(RemoteException::class)
+    override fun abort() {
+        operation.abort()
     }
 }
