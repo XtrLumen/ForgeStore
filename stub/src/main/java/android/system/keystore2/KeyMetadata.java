@@ -8,7 +8,7 @@ import androidx.annotation.Nullable;
 public class KeyMetadata implements Parcelable {
     public int keySecurityLevel;
     public KeyDescriptor key;
-    public Long modificationTimeMs;
+    public long modificationTimeMs = 0;
     public Authorization[] authorizations;
     @Nullable public byte[] certificate;
     @Nullable public byte[] certificateChain;
