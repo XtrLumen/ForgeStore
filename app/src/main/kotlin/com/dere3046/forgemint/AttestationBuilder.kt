@@ -16,6 +16,35 @@ import java.security.MessageDigest
 
 object AttestationBuilder {
 
+    val bootKey: ByteArray by lazy { initBootKey() }
+    val bootHash: ByteArray by lazy { initBootHash() }
+
+    val osVersion: Int by lazy {
+        val release = Build.VERSION.RELEASE ?: "15"
+        val parts = release.split(".").map { it.toIntOrNull() ?: 0 }
+        when (parts.size) {
+            1 -> parts[0] * 10000
+            2 -> parts[0] * 10000 + parts[1] * 100
+            3 -> parts[0] * 10000 + parts[1] * 100 + parts[2]
+            else -> 160000
+        }
+    }
+
+    fun getAttestVersion(securityLevel: Int): Int {
+        if (securityLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX) return 300
+        return when {
+            Build.VERSION.SDK_INT >= 36 -> 400
+            Build.VERSION.SDK_INT >= 33 -> 300
+            Build.VERSION.SDK_INT >= 31 -> 200
+            else -> 100
+        }
+    }
+
+    fun getKeymasterVersion(securityLevel: Int): Int {
+        val av = getAttestVersion(securityLevel)
+        return if (av >= 100) av else 41
+    }
+
     fun buildAttestationExtension(
         params: KeyMintAttestation,
         uid: Int,
@@ -29,10 +58,63 @@ object AttestationBuilder {
         )
     }
 
-    private fun attestVersion(): Long = when {
-        Build.VERSION.SDK_INT >= 35 -> 400
-        Build.VERSION.SDK_INT >= 34 -> 300
-        else -> 200
+    fun buildRootOfTrust(originalRootOfTrust: ASN1Encodable? = null): DERSequence {
+        val rootElements = arrayOfNulls<ASN1Encodable>(4)
+        rootElements[AttestationConstants.ROOT_OF_TRUST_VERIFIED_BOOT_KEY_INDEX] =
+            DEROctetString(bootKey)
+        rootElements[AttestationConstants.ROOT_OF_TRUST_DEVICE_LOCKED_INDEX] =
+            ASN1Boolean.TRUE
+        rootElements[AttestationConstants.ROOT_OF_TRUST_VERIFIED_BOOT_STATE_INDEX] =
+            ASN1Enumerated(0)
+        rootElements[AttestationConstants.ROOT_OF_TRUST_VERIFIED_BOOT_HASH_INDEX] =
+            DEROctetString(bootHash)
+        return DERSequence(rootElements)
+    }
+
+    fun getSimulatedHardwareProperties(uid: Int): Map<Int, DERTaggedObject?> {
+        val props = mutableMapOf<Int, DERTaggedObject?>()
+
+        props[AttestationConstants.TAG_OS_VERSION] = DERTaggedObject(
+            true, AttestationConstants.TAG_OS_VERSION,
+            ASN1Integer(osVersion.toLong()),
+        )
+
+        val osPatch = getPatchLevel()
+        props[AttestationConstants.TAG_OS_PATCHLEVEL] = DERTaggedObject(
+            true, AttestationConstants.TAG_OS_PATCHLEVEL,
+            ASN1Integer(osPatch.toLong()),
+        )
+
+        val vendorPatch = getPatchLevelLong()
+        props[AttestationConstants.TAG_VENDOR_PATCHLEVEL] = DERTaggedObject(
+            true, AttestationConstants.TAG_VENDOR_PATCHLEVEL,
+            ASN1Integer(vendorPatch.toLong()),
+        )
+
+        val bootPatch = getPatchLevelLong()
+        props[AttestationConstants.TAG_BOOT_PATCHLEVEL] = DERTaggedObject(
+            true, AttestationConstants.TAG_BOOT_PATCHLEVEL,
+            ASN1Integer(bootPatch.toLong()),
+        )
+
+        return props
+    }
+
+    fun getPatchLevel(): Int {
+        val patch = Build.VERSION.SECURITY_PATCH ?: "2026-06"
+        val parts = patch.split("-")
+        if (parts.size == 2) {
+            val y = parts[0].toIntOrNull() ?: 2026
+            val m = parts[1].toIntOrNull() ?: 6
+            return (y - 2000) * 12 + m
+        }
+        return 26206
+    }
+
+    fun getPatchLevelLong(): Int {
+        val patch = Build.VERSION.SECURITY_PATCH ?: "2026-06-01"
+        val digits = patch.replace("-", "")
+        return digits.take(8).toIntOrNull() ?: 20260601
     }
 
     private fun buildKeyDescription(
@@ -40,19 +122,18 @@ object AttestationBuilder {
         uid: Int,
         securityLevel: Int,
     ): DERSequence {
-        val ver = attestVersion()
-        val kmVer = if (ver >= 100) ver else 41
-        Logger.d("Building KeyDescription ver=$ver kmVer=$kmVer securityLevel=$securityLevel algo=${params.algorithm}")
-        val teeEnforced = buildTeeEnforcedList(params, uid, securityLevel, ver)
-        val softwareEnforced = buildSoftwareEnforcedList(params, uid, securityLevel, ver)
+        val ver = getAttestVersion(securityLevel)
+        val kmVer = getKeymasterVersion(securityLevel)
+        val teeEnforced = buildTeeEnforcedList(params, uid, securityLevel)
+        val softwareEnforced = buildSoftwareEnforcedList(params, uid, securityLevel)
 
         val fields = arrayOf(
-            ASN1Integer(ver), // attestationVersion
-            ASN1Enumerated(securityLevel), // attestationSecurityLevel
-            ASN1Integer(kmVer), // keyMintVersion
-            ASN1Enumerated(securityLevel), // keymintSecurityLevel
+            ASN1Integer(ver.toLong()),
+            ASN1Enumerated(securityLevel),
+            ASN1Integer(kmVer.toLong()),
+            ASN1Enumerated(securityLevel),
             DEROctetString(params.attestationChallenge ?: ByteArray(0)),
-            DEROctetString(ByteArray(0)), // uniqueId
+            DEROctetString(ByteArray(0)),
             softwareEnforced,
             teeEnforced,
         )
@@ -63,7 +144,6 @@ object AttestationBuilder {
         params: KeyMintAttestation,
         uid: Int,
         securityLevel: Int,
-        ver: Long,
     ): DERSequence {
         val list = mutableListOf<ASN1Encodable>(
             DERTaggedObject(true, AttestationConstants.TAG_PURPOSE,
@@ -76,17 +156,13 @@ object AttestationBuilder {
                 DERSet(params.digest.map { ASN1Integer(it.toLong()) }.toTypedArray())),
         )
 
-        if (params.blockMode.isNotEmpty()) {
-            list.add(DERTaggedObject(true, AttestationConstants.TAG_BLOCK_MODE,
-                DERSet(params.blockMode.map { ASN1Integer(it.toLong()) }.toTypedArray())))
+        if (params.ecCurve != null) {
+            list.add(DERTaggedObject(true, AttestationConstants.TAG_EC_CURVE,
+                ASN1Integer(params.ecCurve.toLong())))
         }
         if (params.padding.isNotEmpty()) {
             list.add(DERTaggedObject(true, AttestationConstants.TAG_PADDING,
                 DERSet(params.padding.map { ASN1Integer(it.toLong()) }.toTypedArray())))
-        }
-        if (params.ecCurve != null) {
-            list.add(DERTaggedObject(true, AttestationConstants.TAG_EC_CURVE,
-                ASN1Integer(params.ecCurve.toLong())))
         }
         if (params.rsaPublicExponent != null) {
             list.add(DERTaggedObject(true, AttestationConstants.TAG_RSA_PUBLIC_EXPONENT,
@@ -96,16 +172,12 @@ object AttestationBuilder {
         list.addAll(listOf(
             DERTaggedObject(true, AttestationConstants.TAG_NO_AUTH_REQUIRED, DERNull.INSTANCE),
             DERTaggedObject(true, AttestationConstants.TAG_ORIGIN, ASN1Integer(0L)),
-            DERTaggedObject(true, AttestationConstants.TAG_ROOT_OF_TRUST, buildRootOfTrust()),
-            DERTaggedObject(true, AttestationConstants.TAG_OS_VERSION,
-                ASN1Integer(getOsVersion().toLong())),
-            DERTaggedObject(true, AttestationConstants.TAG_OS_PATCHLEVEL,
-                ASN1Integer(getOsPatchLevel().toLong())),
-            DERTaggedObject(true, AttestationConstants.TAG_VENDOR_PATCHLEVEL,
-                ASN1Integer(getVendorPatchLevel().toLong())),
-            DERTaggedObject(true, AttestationConstants.TAG_BOOT_PATCHLEVEL,
-                ASN1Integer(getBootPatchLevel().toLong())),
-        )        )
+            DERTaggedObject(true, AttestationConstants.TAG_ROOT_OF_TRUST, buildRootOfTrust(null)),
+        ))
+
+        val simulated = getSimulatedHardwareProperties(uid)
+        simulated.values.filterNotNull().forEach { list.add(it) }
+
         params.brand?.let {
             list.add(DERTaggedObject(true, AttestationConstants.TAG_ATTESTATION_ID_BRAND, DEROctetString(it)))
         }
@@ -130,12 +202,11 @@ object AttestationBuilder {
         params.model?.let {
             list.add(DERTaggedObject(true, AttestationConstants.TAG_ATTESTATION_ID_MODEL, DEROctetString(it)))
         }
-        if (ver >= 400) {
+        if (getAttestVersion(securityLevel) >= 300) {
             params.secondImei?.let {
                 list.add(DERTaggedObject(true, AttestationConstants.TAG_ATTESTATION_ID_SECOND_IMEI, DEROctetString(it)))
             }
         }
-
         return DERSequence(list.sortedBy { (it as DERTaggedObject).tagNo }.toTypedArray())
     }
 
@@ -143,7 +214,6 @@ object AttestationBuilder {
         params: KeyMintAttestation,
         uid: Int,
         securityLevel: Int,
-        ver: Long,
     ): DERSequence {
         val list = mutableListOf<ASN1Encodable>(
             DERTaggedObject(true, AttestationConstants.TAG_CREATION_DATETIME,
@@ -153,32 +223,11 @@ object AttestationBuilder {
             list.add(DERTaggedObject(true, AttestationConstants.TAG_ATTESTATION_APPLICATION_ID,
                 DEROctetString(getApplicationId(uid))))
         }
-        if (ver >= 400) {
+        if (getAttestVersion(securityLevel) >= 400) {
             list.add(DERTaggedObject(true, AttestationConstants.TAG_MODULE_HASH,
                 DEROctetString(readModuleHash())))
         }
         return DERSequence(list.toTypedArray())
-    }
-
-    private fun buildRootOfTrust(): DERSequence {
-        val bootKey = readHexProperty("ro.boot.vbmeta.public_key_digest")
-        val bootHash = readHexProperty("ro.boot.vbmeta.digest")
-        return DERSequence(arrayOf(
-            DEROctetString(bootKey),
-            ASN1Boolean.TRUE,
-            ASN1Enumerated(0),
-            DEROctetString(bootHash),
-        ))
-    }
-
-    private fun readModuleHash(): ByteArray {
-        val value = try {
-            val cls = Class.forName("android.os.SystemProperties")
-            val m = cls.getMethod("get", String::class.java, String::class.java)
-            m.invoke(null, "ro.boot.avb_modules_hash", "") as String
-        } catch (_: Exception) { "" }
-        if (value.isNotEmpty()) return hexStringToByteArray(value)
-        return ByteArray(32) { (it * 5 + 1).toByte() }
     }
 
     private fun getApplicationId(uid: Int): ByteArray {
@@ -204,40 +253,35 @@ object AttestationBuilder {
         )).encoded
     }
 
-    private fun readHexProperty(key: String): ByteArray {
+    private fun readModuleHash(): ByteArray {
         val value = try {
             val cls = Class.forName("android.os.SystemProperties")
             val m = cls.getMethod("get", String::class.java, String::class.java)
-            m.invoke(null, key, "") as String
+            m.invoke(null, "ro.boot.avb_modules_hash", "") as String
         } catch (_: Exception) { "" }
-        if (value.isEmpty()) return ByteArray(32) { (it * 7 + 3).toByte() }
-        return hexStringToByteArray(value)
+        if (value.isNotEmpty()) return hexStringToByteArray(value)
+        return ByteArray(32) { (it * 5 + 1).toByte() }
     }
 
-    private fun getOsVersion(): Int {
-        val release = Build.VERSION.RELEASE ?: "15"
-        val parts = release.split(".").map { it.toIntOrNull() ?: 0 }
-        return when (parts.size) {
-            1 -> parts[0] * 10000
-            2 -> parts[0] * 10000 + parts[1] * 100
-            3 -> parts[0] * 10000 + parts[1] * 100 + parts[2]
-            else -> 150000
-        }
+    private fun initBootKey(): ByteArray {
+        val value = try {
+            val cls = Class.forName("android.os.SystemProperties")
+            val m = cls.getMethod("get", String::class.java, String::class.java)
+            m.invoke(null, "ro.boot.vbmeta.public_key_digest", "") as String
+        } catch (_: Exception) { "" }
+        if (value.isNotEmpty() && value.length >= 64) return hexStringToByteArray(value)
+        return ByteArray(32) { (it * 7 + 3).toByte() }
     }
 
-    private fun getOsPatchLevel(): Int {
-        val patch = Build.VERSION.SECURITY_PATCH ?: "2026-06"
-        val parts = patch.split("-")
-        if (parts.size == 2) {
-            val y = parts[0].toIntOrNull() ?: 2026
-            val m = parts[1].toIntOrNull() ?: 6
-            return (y - 2000) * 12 + m
-        }
-        return 26206
+    private fun initBootHash(): ByteArray {
+        val value = try {
+            val cls = Class.forName("android.os.SystemProperties")
+            val m = cls.getMethod("get", String::class.java, String::class.java)
+            m.invoke(null, "ro.boot.vbmeta.digest", "") as String
+        } catch (_: Exception) { "" }
+        if (value.isNotEmpty() && value.length >= 64) return hexStringToByteArray(value)
+        return ByteArray(32) { (it * 11 + 5).toByte() }
     }
-
-    private fun getVendorPatchLevel(): Int = getOsPatchLevel()
-    private fun getBootPatchLevel(): Int = getOsPatchLevel()
 
     private fun hexStringToByteArray(s: String): ByteArray {
         val len = s.length

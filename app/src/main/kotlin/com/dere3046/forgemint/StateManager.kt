@@ -3,10 +3,13 @@ package com.dere3046.forgemint
 import android.os.IBinder
 import android.system.keystore2.KeyMetadata
 import java.security.KeyPair
+import java.security.cert.Certificate
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
 
 object StateManager {
+
+    data class KeyIdentifier(val uid: Int, val alias: String)
 
     data class KeyEntry(
         val uid: Int,
@@ -20,6 +23,7 @@ object StateManager {
     )
 
     private val cache = ConcurrentHashMap<String, KeyEntry>()
+    private val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
 
     fun store(entry: KeyEntry) {
         cache[key(entry.uid, entry.alias)] = entry
@@ -31,10 +35,19 @@ object StateManager {
         return cache.values.find { it.uid == uid && it.nspace == nspace }
     }
 
-    fun remove(uid: Int, alias: String) { cache.remove(key(uid, alias)) }
+    fun remove(uid: Int, alias: String) {
+        cache.remove(key(uid, alias))
+        patchedChains.remove(KeyIdentifier(uid, alias))
+    }
 
     fun listForUid(uid: Int): List<KeyEntry> {
         return cache.values.filter { it.uid == uid }
+    }
+
+    fun getPatchedChain(keyId: KeyIdentifier): Array<Certificate>? = patchedChains[keyId]
+
+    fun cachePatchedChain(keyId: KeyIdentifier, chain: Array<Certificate>) {
+        patchedChains[keyId] = chain
     }
 
     private fun key(uid: Int, alias: String) = "$uid:$alias"

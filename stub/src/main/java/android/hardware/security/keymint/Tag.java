@@ -12,6 +12,7 @@ public @interface Tag {
     int MIN_MAC_LENGTH = 8;
     int EC_CURVE = 10;
     int RSA_PUBLIC_EXPONENT = 200;
+    int USER_ID = 501;
     int NO_AUTH_REQUIRED = 503;
     int ORIGIN = 702;
     int CREATION_DATETIME = 701;

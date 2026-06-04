@@ -50,6 +50,10 @@ class Keystore2Interceptor : BinderInterceptor() {
             return injectGeneratedKeys(reply, callingUid)
         }
 
+        if (code == GET_KEY_ENTRY_TRANSACTION) {
+            return handlePostGetKeyEntry(callingUid, data, reply)
+        }
+
         return TransactionResult.Skip
     }
 
@@ -89,6 +93,46 @@ class Keystore2Interceptor : BinderInterceptor() {
             }
         } catch (_: Exception) {}
         return TransactionResult.Continue
+    }
+
+    private fun handlePostGetKeyEntry(uid: Int, data: Parcel, reply: Parcel): TransactionResult {
+        try {
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Skip
+
+            val response = reply.readTypedObject(KeyEntryResponse.CREATOR) ?: return TransactionResult.Skip
+
+            val originalChain = CertificateHelper.getCertificateChain(response.metadata) ?: return TransactionResult.Skip
+
+            if (originalChain.size <= 1) {
+                Logger.d("getKeyEntry POST: chain too short for alias=${keyDescriptor.alias}")
+                return TransactionResult.Skip
+            }
+
+            val keyId = StateManager.KeyIdentifier(uid, keyDescriptor.alias ?: return TransactionResult.Skip)
+
+            val cachedChain = StateManager.getPatchedChain(keyId)
+            val patchedChain: Array<java.security.cert.Certificate>
+            if (cachedChain != null) {
+                Logger.d("getKeyEntry POST: using cached patched chain for alias=${keyDescriptor.alias}")
+                patchedChain = cachedChain
+            } else {
+                Logger.i("getKeyEntry POST: live patching chain for alias=${keyDescriptor.alias}")
+                patchedChain = AttestationPatcher.patchCertificateChain(originalChain, uid)
+                StateManager.cachePatchedChain(keyId, patchedChain)
+            }
+
+            CertificateHelper.updateCertificateChain(uid, response.metadata, patchedChain)
+                .onFailure { e -> Logger.e("updateCertificateChain failed", e) }
+
+            val override = Parcel.obtain()
+            override.writeNoException()
+            override.writeTypedObject(response, 0)
+            return TransactionResult.OverrideReply(override)
+        } catch (e: Exception) {
+            Logger.e("getKeyEntry POST patch failed", e)
+            return TransactionResult.Skip
+        }
     }
 
     private fun injectGeneratedKeys(reply: Parcel, uid: Int): TransactionResult {

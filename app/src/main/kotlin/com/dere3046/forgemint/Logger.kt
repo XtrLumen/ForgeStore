@@ -11,3 +11,5 @@ object Logger {
     fun w(msg: String, t: Throwable) = Log.w(TAG, msg, t)
     fun e(msg: String, t: Throwable? = null) = if (t != null) Log.e(TAG, msg, t) else Log.e(TAG, msg)
 }
+
+fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
