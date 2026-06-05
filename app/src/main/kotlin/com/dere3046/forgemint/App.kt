@@ -21,9 +21,10 @@ object App {
     @JvmStatic
     fun main(args: Array<String>) {
         modDir = System.getProperty("moddir") ?: "/data/adb/modules/forgemint"
-        Logger.i("ForgeMint daemon starting (moddir=$modDir)")
 
-        KmsgLogger.init()
+        val debugFile = java.io.File("/data/adb/forgemint/debug")
+        Logger.setMode(debugFile.exists())
+        Logger.i("ForgeMint daemon starting (moddir=$modDir, mode=${if (Logger.useLogcat) "logcat" else "kmsg"})")
         prepareEnvironment()
         setupProviders()
         ConfigManager.initialize()
