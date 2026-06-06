@@ -198,7 +198,14 @@ class KeyMintInterceptor(
             override.writeTypedObject(metadata, 0)
             return TransactionResult.OverrideReply(override)
         } catch (e: Exception) {
-            Logger.e("PATCH mode post-generateKey failed", e)
+            val alias = runCatching {
+                val savedPos = data.dataPosition()
+                data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                val desc = data.readTypedObject(KeyDescriptor.CREATOR)
+                data.setDataPosition(savedPos)
+                desc?.alias
+            }.getOrNull() ?: "<unknown>"
+            Logger.w("PostGen failed uid=$callingUid alias=$alias msg=${e.message?.take(60)}")
             return TransactionResult.Skip
         }
     }
@@ -253,6 +260,9 @@ class KeyMintInterceptor(
         uid: Int,
         data: Parcel,
     ): TransactionResult {
+        if (securityLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX) {
+            Logger.w("StrongBox: handleCreateOp uid=$uid txId=$txId")
+        }
         try {
             data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
