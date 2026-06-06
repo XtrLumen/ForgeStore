@@ -42,17 +42,22 @@ jobs:
           chmod +x gradlew
           ./gradlew zipDebug zipRelease
 
+      - name: rename for artifact
+        run: |
+          cp out/*-Debug.zip out/forgemint-debug
+          cp out/*-Release.zip out/forgemint-release
+
       - name: upload debug
         uses: actions/upload-artifact@v5
         with:
           name: forgemint-debug
-          path: out/*-Debug.zip
+          path: out/forgemint-debug
 
       - name: upload release
         uses: actions/upload-artifact@v5
         with:
           name: forgemint-release
-          path: out/*-Release.zip
+          path: out/forgemint-release
 
       - name: publish release
         if: startsWith(github.ref, 'refs/tags/v')
