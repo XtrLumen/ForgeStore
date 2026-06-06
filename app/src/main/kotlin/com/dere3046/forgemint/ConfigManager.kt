@@ -43,7 +43,7 @@ object ConfigManager {
     private val configDefaults = mapOf(
         "debug" to false,
         "verbose_log" to false,
-        "fallback" to true,
+        "fallback" to false,
         "whitelist_mode" to false,
     )
     private val configMap = ConcurrentHashMap<String, Boolean>()
