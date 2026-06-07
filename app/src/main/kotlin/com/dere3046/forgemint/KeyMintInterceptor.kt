@@ -105,12 +105,13 @@ class KeyMintInterceptor(
             (genParams.attestationKeyDescriptor != null && isKnownAttestationKey(callingUid, genParams.attestationKeyDescriptor))
 
         if (needsSoftwareGen) {
+            Logger.w("genKey dispatch: isAttestKey=${params.isAttestKey} shouldGen=${ConfigManager.shouldGenerate(callingUid)} shouldPatch=${ConfigManager.shouldPatch(callingUid)} uid=$callingUid algo=${params.algorithm} alias=${genParams.descriptor.alias} nspace=${genParams.descriptor.nspace} ecCurve=${params.ecCurve}")
             val result = tryGenerateSoftwareKey(params, genParams.descriptor, genParams.attestationKeyDescriptor, callingUid)
             if (result != null) {
                 Logger.i("Software key generated for UID=$callingUid")
                 return result
             }
-            Logger.w("Software generation failed (isAttestKey=${params.isAttestKey} challenge=${params.attestationChallenge != null}), falling back to HAL")
+            Logger.w("Software generation failed (isAttestKey=${params.isAttestKey} challenge=${params.attestationChallenge != null}), falling back to HAL uid=$callingUid")
         }
 
         if (ConfigManager.shouldPatch(callingUid) && params.attestationChallenge != null) {
@@ -587,7 +588,7 @@ class KeyMintInterceptor(
         uid: Int,
         startNanos: Long,
     ): TransactionResult? {
-        Logger.d("tryGenerateAttestKey algo=${params.algorithm} uid=$uid")
+        Logger.w("tryGenerateAttestKey: uid=$uid alias=${descriptor.alias} algo=${params.algorithm} ecCurve=${params.ecCurve}")
 
         val keyPair = CertificateBuilder.generateKeyPair(params)
         if (keyPair == null) {
