@@ -390,8 +390,7 @@ class KeyMintInterceptor(
                 }
                 operation.onFinishCallback = {
                     if (counter.decrementAndGet() <= 0) {
-                        Logger.d("createOperation: usage count exhausted, removing key alias=${entry.alias}")
-                        cleanupKeyData(this, keyId)
+                        Logger.d("createOperation: usage count exhausted alias=${entry.alias}")
                     }
                 }
             }
@@ -671,13 +670,20 @@ class KeyMintInterceptor(
         }
 
         val chain = when {
-            keybox != null && keybox.certificates.isNotEmpty() && !ConfigManager.isFallbackEnabled ->
-                CertificateBuilder.generateCertificateChain(
-                    keyPair, keybox, params, uid, securityLevel,
-                    signerKeyPair, attestKeyCert,
-                ).also { Logger.d("Software gen: using keybox chain for UID=$uid") }
+            keybox != null && keybox.certificates.isNotEmpty() -> {
+                val sameAlgo = keybox.keyPair.private.algorithm == keyPair.private.algorithm
+                if (!ConfigManager.isFallbackEnabled || sameAlgo) {
+                    CertificateBuilder.generateCertificateChain(
+                        keyPair, keybox, params, uid, securityLevel,
+                        signerKeyPair, attestKeyCert,
+                    ).also { Logger.d("Software gen: using keybox chain for UID=$uid") }
+                } else {
+                    Logger.w("keybox algorithm mismatch, using self-signed for UID=$uid")
+                    CertificateBuilder.generateFallbackChain(keyPair, params, uid, securityLevel)
+                }
+            }
             ConfigManager.isFallbackEnabled -> {
-                Logger.w("keybox empty or fallback enabled, using self-signed for UID=$uid")
+                Logger.w("keybox empty, using self-signed for UID=$uid")
                 CertificateBuilder.generateFallbackChain(keyPair, params, uid, securityLevel)
             }
             else -> {
@@ -753,8 +759,14 @@ class KeyMintInterceptor(
 
         val keybox = KeyboxReader.loadKeybox(params.algorithm)
         val chain = when {
-            keybox != null && keybox.certificates.isNotEmpty() && !ConfigManager.isFallbackEnabled ->
-                CertificateBuilder.generateCertificateChain(keyPair, keybox, params, uid, securityLevel)
+            keybox != null && keybox.certificates.isNotEmpty() -> {
+                val sameAlgo = keybox.keyPair.private.algorithm == keyPair.private.algorithm
+                if (!ConfigManager.isFallbackEnabled || sameAlgo) {
+                    CertificateBuilder.generateCertificateChain(keyPair, keybox, params, uid, securityLevel)
+                } else {
+                    CertificateBuilder.generateFallbackChain(keyPair, params, uid, securityLevel)
+                }
+            }
             ConfigManager.isFallbackEnabled ->
                 CertificateBuilder.generateFallbackChain(keyPair, params, uid, securityLevel)
             else -> {
