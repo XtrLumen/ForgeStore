@@ -671,13 +671,13 @@ class KeyMintInterceptor(
         }
 
         val chain = when {
-            keybox != null && keybox.certificates.isNotEmpty() ->
+            keybox != null && keybox.certificates.isNotEmpty() && !ConfigManager.isFallbackEnabled ->
                 CertificateBuilder.generateCertificateChain(
                     keyPair, keybox, params, uid, securityLevel,
                     signerKeyPair, attestKeyCert,
                 ).also { Logger.d("Software gen: using keybox chain for UID=$uid") }
-            keybox != null && ConfigManager.isFallbackEnabled -> {
-                Logger.w("keybox configured but certificates empty, using self-signed fallback for UID=$uid")
+            ConfigManager.isFallbackEnabled -> {
+                Logger.w("keybox empty or fallback enabled, using self-signed for UID=$uid")
                 CertificateBuilder.generateFallbackChain(keyPair, params, uid, securityLevel)
             }
             else -> {
@@ -753,9 +753,9 @@ class KeyMintInterceptor(
 
         val keybox = KeyboxReader.loadKeybox(params.algorithm)
         val chain = when {
-            keybox != null && keybox.certificates.isNotEmpty() ->
+            keybox != null && keybox.certificates.isNotEmpty() && !ConfigManager.isFallbackEnabled ->
                 CertificateBuilder.generateCertificateChain(keyPair, keybox, params, uid, securityLevel)
-            keybox != null && ConfigManager.isFallbackEnabled ->
+            ConfigManager.isFallbackEnabled ->
                 CertificateBuilder.generateFallbackChain(keyPair, params, uid, securityLevel)
             else -> {
                 Logger.w("no keybox configured for attest key, falling back to HAL")
