@@ -47,6 +47,7 @@ class KeyMintInterceptor(
     val patchedChains = ConcurrentHashMap<StateManager.KeyIdentifier, Array<Certificate>>()
     val attestationKeys = ConcurrentHashMap.newKeySet<StateManager.KeyIdentifier>()
     val importedKeys = ConcurrentHashMap.newKeySet<StateManager.KeyIdentifier>()
+    val usageCounters = ConcurrentHashMap<StateManager.KeyIdentifier, java.util.concurrent.atomic.AtomicInteger>()
     val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
     val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
     val nspaceToAlias = ConcurrentHashMap<String, String>()
@@ -370,7 +371,30 @@ class KeyMintInterceptor(
 
             Logger.d("createOperation for generated key alias=${entry.alias} nspace=${keyDescriptor.nspace} algo=${parsedParams.algorithm} purpose=${parsedParams.purpose.firstOrNull()} secLevel=$securityLevel")
 
+            val maxUsage = parsedParams.maxUsesPerBoot
+            val keyId = StateManager.KeyIdentifier(uid, entry.alias)
+            if (maxUsage != null && maxUsage > 0) {
+                val counter = usageCounters.computeIfAbsent(keyId) {
+                    java.util.concurrent.atomic.AtomicInteger(maxUsage)
+                }
+                if (counter.get() <= 0) {
+                    Logger.d("createOperation: usage count exhausted for alias=${entry.alias}")
+                    return replyKeymintError(7) ?: TransactionResult.Skip
+                }
+            }
+
             val operation = SoftwareOperation(txId, entry.keyPair, entry.secretKey, parsedParams, securityLevel, uid)
+            if (maxUsage != null && maxUsage > 0) {
+                val counter = usageCounters[keyId] ?: usageCounters.computeIfAbsent(keyId) {
+                    java.util.concurrent.atomic.AtomicInteger(maxUsage)
+                }
+                operation.onFinishCallback = {
+                    if (counter.decrementAndGet() <= 0) {
+                        Logger.d("createOperation: usage count exhausted, removing key alias=${entry.alias}")
+                        cleanupKeyData(this, keyId)
+                    }
+                }
+            }
             if (securityLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX &&
                 countActiveOps(uid) >= getOpLimit(securityLevel)) {
                 Logger.w("createOperation: StrongBox op limit reached uid=$uid active=${countActiveOps(uid)}")
@@ -558,6 +582,7 @@ class KeyMintInterceptor(
             interceptor.patchedChains.remove(keyId)
             interceptor.attestationKeys.remove(keyId)
             interceptor.importedKeys.remove(keyId)
+            interceptor.usageCounters.remove(keyId)
         }
 
         fun purgeGrantsForKey(interceptor: KeyMintInterceptor, keyId: StateManager.KeyIdentifier) {

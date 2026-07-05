@@ -36,6 +36,7 @@ import java.security.Signature
 import java.security.SignatureException
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 
@@ -224,6 +225,40 @@ private class KeyAgreementPrimitive(keyPair: KeyPair) : CryptoPrimitive {
     override fun abort() {}
 }
 
+private class MacPrimitive(private val mac: javax.crypto.Mac) : CryptoPrimitive {
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray {
+        if (data != null) mac.update(data)
+        return mac.doFinal()
+    }
+
+    override fun abort() {}
+}
+
+private class MacVerifier(private val mac: javax.crypto.Mac) : CryptoPrimitive {
+    override fun update(data: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        return null
+    }
+
+    override fun finish(data: ByteArray?, signature: ByteArray?): ByteArray? {
+        if (data != null) mac.update(data)
+        if (signature == null) throw ServiceSpecificException(
+            KeystoreErrorCodes.verificationFailed, "Signature to verify is null",
+        )
+        if (!mac.doFinal().contentEquals(signature)) {
+            throw ServiceSpecificException(KeystoreErrorCodes.verificationFailed, "MAC verification failed")
+        }
+        return null
+    }
+
+    override fun abort() {}
+}
+
 class SoftwareOperation(
     private val txId: Long,
     keyPair: KeyPair?,
@@ -236,6 +271,8 @@ class SoftwareOperation(
 
     @Volatile var finalized = false
         private set
+
+    @Volatile var onFinishCallback: (() -> Unit)? = null
 
     private val latencyFloorMs: Long = when (params.algorithm) {
         Algorithm.EC -> 20L
@@ -250,25 +287,37 @@ class SoftwareOperation(
         Logger.d("SoftwareOperation txId=$txId purpose=$purpose")
         primitive = when (purpose) {
             KeyPurpose.SIGN -> {
-                val kp = keyPair ?: throw ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, "No key pair for SIGN")
-                Signer(kp, params)
+                if (secretKey != null) {
+                    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                    mac.init(secretKey)
+                    MacPrimitive(mac)
+                } else {
+                    val kp = keyPair ?: throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument, "No key pair for SIGN")
+                    Signer(kp, params)
+                }
             }
             KeyPurpose.VERIFY -> {
-                val kp = keyPair ?: throw ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, "No key pair for VERIFY")
-                Verifier(kp, params)
+                if (secretKey != null) {
+                    val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+                    mac.init(secretKey)
+                    MacVerifier(mac)
+                } else {
+                    val kp = keyPair ?: throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument, "No key pair for VERIFY")
+                    Verifier(kp, params)
+                }
             }
             KeyPurpose.ENCRYPT -> {
                 val key: java.security.Key = secretKey ?: keyPair?.public
-                    ?: throw ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, "No key for ENCRYPT")
+                    ?: throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument, "No key for ENCRYPT")
                 CipherPrimitive(key, params, Cipher.ENCRYPT_MODE)
             }
             KeyPurpose.DECRYPT -> {
                 val key: java.security.Key = secretKey ?: keyPair?.private
-                    ?: throw ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, "No key for DECRYPT")
+                    ?: throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument, "No key for DECRYPT")
                 CipherPrimitive(key, params, Cipher.DECRYPT_MODE)
             }
             KeyPurpose.AGREE_KEY -> {
-                val kp = keyPair ?: throw ServiceSpecificException(KeystoreErrorCodes.incompatibleKey, "No key pair for AGREE_KEY")
+                val kp = keyPair ?: throw ServiceSpecificException(KeystoreErrorCodes.invalidArgument, "No key pair for AGREE_KEY")
                 KeyAgreementPrimitive(kp)
             }
             else -> throw ServiceSpecificException(
@@ -313,6 +362,7 @@ class SoftwareOperation(
             throw mapToServiceSpecificException(e)
         } finally {
             if (finalized) {
+                onFinishCallback?.invoke()
                 applyLatency(start)
             }
         }
@@ -368,17 +418,21 @@ class SoftwareOperation(
 class SoftwareOperationBinder(private val operation: SoftwareOperation) :
     IKeystoreOperation.Stub() {
 
+    @Synchronized
     @Throws(RemoteException::class)
     override fun update(input: ByteArray?): ByteArray? = operation.update(input)
 
+    @Synchronized
     @Throws(RemoteException::class)
     override fun updateAad(input: ByteArray?) {
         operation.updateAad(input)
     }
 
+    @Synchronized
     @Throws(RemoteException::class)
     override fun finish(input: ByteArray?, signature: ByteArray?): ByteArray? = operation.finish(input, signature)
 
+    @Synchronized
     @Throws(RemoteException::class)
     override fun abort() = operation.abort()
 }

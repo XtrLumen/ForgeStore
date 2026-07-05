@@ -42,6 +42,12 @@ object AuthorizeCreate {
 
         validatePurposeMatch(purpose, keyParams.purpose)?.let { return it }
 
+        validateDigestMatch(params, keyParams)?.let { return it }
+
+        validatePaddingMatch(params, keyParams)?.let { return it }
+
+        validateBlockModeMatch(params, keyParams)?.let { return it }
+
         validateTemporal(
             params.activeDateTime?.time,
             params.originationExpireDateTime?.time,
@@ -77,6 +83,27 @@ object AuthorizeCreate {
         if (!keyPurposes.contains(purpose)) {
             return ValidationResult(false, -38)
         }
+        return null
+    }
+
+    private fun validateDigestMatch(params: KeyMintAttestation, keyParams: KeyMintAttestation): ValidationResult? {
+        val opDigest = params.digest
+        if (opDigest.isEmpty()) return null
+        if (opDigest.any { it !in keyParams.digest }) return ValidationResult(false, -17)
+        return null
+    }
+
+    private fun validatePaddingMatch(params: KeyMintAttestation, keyParams: KeyMintAttestation): ValidationResult? {
+        val opPadding = params.padding
+        if (opPadding.isEmpty()) return null
+        if (opPadding.any { it !in keyParams.padding }) return ValidationResult(false, -32)
+        return null
+    }
+
+    private fun validateBlockModeMatch(params: KeyMintAttestation, keyParams: KeyMintAttestation): ValidationResult? {
+        val opMode = params.blockMode
+        if (opMode.isEmpty()) return null
+        if (opMode.any { it !in keyParams.blockMode }) return ValidationResult(false, -29)
         return null
     }
 
