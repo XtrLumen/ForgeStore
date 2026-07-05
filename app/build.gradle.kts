@@ -4,76 +4,32 @@ import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
 plugins {
-    alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
 }
 
-abstract class GitExecutor @Inject constructor(private val execOperations: ExecOperations) {
-    fun execute(command: String, currentWorkingDir: File): String {
-        val byteOut = ByteArrayOutputStream()
-        execOperations.exec {
-            workingDir = currentWorkingDir
-            commandLine = command.split("\\s".toRegex())
-            standardOutput = byteOut
-        }
-        return String(byteOut.toByteArray()).trim()
-    }
+dependencies {
+    compileOnly("androidx.annotation:annotation:1.9.1")
+    compileOnly(project(":stub"))
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.83")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
 }
 
-val gitExecutor = objects.newInstance(GitExecutor::class.java)
-val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toIntOrNull() ?: 0
-val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir).ifEmpty { "local" }
-val verName = "v0.1"
-val appId = "com.dere3046.forgestore"
+val verName: String by rootProject.extra
+val verType: String by rootProject.extra
+val verCode: Int by rootProject.extra
+val verHash: String by rootProject.extra
 
 android {
-    namespace = appId
-    compileSdk = 36
+    namespace = "com.dere3046.forgestore"
+    buildToolsVersion = "36.0.0"
     ndkVersion = "25.1.8937393"
-
+    compileSdk = 36
     defaultConfig {
-        applicationId = appId
         minSdk = 29
         targetSdk = 36
-        versionCode = gitCommitCount
+        versionCode = verCode
         versionName = verName
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = true
-            proguardFiles("proguard-rules.pro")
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
-    buildFeatures { buildConfig = true }
-
-    packaging {
-        resources {
-            excludes += setOf(
-                "META-INF/DEPENDENCIES",
-                "META-INF/LICENSE",
-                "META-INF/LICENSE.txt",
-                "META-INF/NOTICE",
-                "META-INF/NOTICE.txt",
-                "META-INF/versions/**",
-            )
-        }
-    }
-
-    sourceSets {
-        getByName("main") {
-            kotlin.srcDirs("src/main/kotlin")
-        }
     }
 
     externalNativeBuild {
@@ -82,13 +38,45 @@ android {
             buildStagingDirectory = layout.buildDirectory.get().asFile
         }
     }
-}
 
-dependencies {
-    compileOnly(project(":stub"))
-    compileOnly(libs.annotation)
-    implementation(libs.bcpkix)
-    implementation(libs.bcprov)
+    buildTypes {
+        debug {
+            versionNameSuffix = "-d"
+        }
+        release {
+            isMinifyEnabled = true
+            vcsInfo.include = false
+            proguardFiles("proguard-rules.pro")
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/versions/**"
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
+
+    dependenciesInfo {
+        includeInApk = false
+    }
+
+    tasks.withType<JavaCompile> {
+        options.compilerArgs.add("-Xlint:deprecation")
+        options.compilerArgs.add("-Xlint:unchecked")
+        options.compilerArgs.add("-Xdiags:verbose")
+    }
 }
 
 androidComponents {
@@ -96,83 +84,87 @@ androidComponents {
         val capitalized = variant.name.replaceFirstChar { it.uppercase() }
 
         val tempModuleDir = project.layout.buildDirectory.dir("module/${variant.name}")
-        val zipFileName = "forgestore-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
+        val zipFileName = "forgestore-$verName-$verCode-$verHash-$capitalized.zip"
 
-        val prepareModuleFilesTask =
-            tasks.register<Sync>("prepareModuleFiles${capitalized}") {
-                group = "ForgeMint Module Packaging"
-                description = "Prepares module files for ${variant.name}."
+        val prepareModuleFilesTask = tasks.register<Sync>("prepareModuleFiles${capitalized}") {
+            group = "ForgeStore Module Packaging"
+            description = "Prepares module files for ${variant.name}."
 
-                dependsOn("package${capitalized}")
-                dependsOn("strip${capitalized}DebugSymbols")
+            dependsOn("package${capitalized}")
+            dependsOn("strip${capitalized}DebugSymbols")
 
-                from(variant.artifacts.get(SingleArtifact.APK)) {
-                    include("*.apk")
-                    rename { "service.apk" }
-                }
-
-                from(
-                    project.layout.buildDirectory.dir(
-                        "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
-                    )
-                ) {
-                    into("lib")
-                    include("**/libforgestore.so", "**/libinject.so")
-                }
-
-                val sourceModuleDir = rootProject.projectDir.resolve("module")
-                from(sourceModuleDir) {
-                    exclude("module.prop")
-                }
-                from(sourceModuleDir) {
-                    include("module.prop")
-                    expand(
-                        "REPLACEMEVERCODE" to gitCommitCount.toString(),
-                        "REPLACEMEVER" to "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
-                    )
-                }
-
-                into(tempModuleDir)
+            from(variant.artifacts.get(SingleArtifact.APK)) {
+                include("*.apk")
+                rename { "service.apk" }
             }
 
-        val generateSha256Task =
-            tasks.register("generateSha256${capitalized}") {
-                group = "ForgeMint Module Packaging"
-                description = "Generates .sha256 sidecar files for all module files."
-                dependsOn(prepareModuleFilesTask)
-                doLast {
-                    val dir = tempModuleDir.get().asFile
-                    val proc = ProcessBuilder("sh", "-c",
-                        "find . -type f ! -name '*.sha256' | while read f; do sha256sum \"\$f\" | cut -d' ' -f1 > \"\${f}.sha256\"; done"
-                    ).directory(dir).inheritIO().start()
-                    proc.waitFor()
-                    if (proc.exitValue() != 0) throw RuntimeException("sha256 generation failed")
-                }
+            from(
+                project.layout.buildDirectory.dir(
+                    "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
+                )
+            ) {
+                into("lib")
+                include("**/libforgestore.so", "**/libinject.so")
             }
 
-        val zipTask =
-            tasks.register<Zip>("zip${capitalized}") {
-                group = "ForgeMint Module Packaging"
-                description = "Creates flashable zip for ${variant.name}."
-                dependsOn(generateSha256Task)
-
-                archiveFileName.set(zipFileName)
-                destinationDirectory.set(rootProject.projectDir.resolve("out"))
-                from(tempModuleDir)
+            val sourceModuleDir = rootProject.projectDir.resolve("module")
+            from(sourceModuleDir) {
+                exclude("module.prop")
+            }
+            from(sourceModuleDir) {
+                include("module.prop")
+                expand(
+                    "REPLACEMEVERCODE" to verCode.toString(),
+                    "REPLACEMEVER" to "$verName ($verCode-$verHash-${variant.name})",
+                )
             }
 
-        tasks.register<Exec>("push${capitalized}") {
-            group = "ForgeMint Module Installation"
+            into(tempModuleDir)
+        }
+
+        val generateSha256Task = tasks.register("generateSha256${capitalized}") {
+            group = "ForgeStore Module Packaging"
+            description = "Generates .sha256 sidecar files for all module files."
+            dependsOn(prepareModuleFilesTask)
+            doLast {
+                val dir = tempModuleDir.get().asFile
+                val proc = ProcessBuilder("sh", "-c",
+                    "find . -type f ! -name '*.sha256' | while read f; do sha256sum \"\$f\" | cut -d' ' -f1 > \"\${f}.sha256\"; done"
+                ).directory(dir).inheritIO().start()
+                proc.waitFor()
+                if (proc.exitValue() != 0) throw RuntimeException("sha256 generation failed")
+            }
+        }
+
+        val zipTask = tasks.register<Zip>("zip${capitalized}") {
+            group = "ForgeStore Module Packaging"
+            description = "Creates flashable zip for ${variant.name}."
+            dependsOn(generateSha256Task)
+
+            archiveFileName.set(zipFileName)
+            destinationDirectory.set(rootProject.projectDir.resolve("out"))
+            from(tempModuleDir)
+        }
+
+        val pushTask = tasks.register<Exec>("push${capitalized}") {
+            group = "ForgeStore Module Installation"
             description = "Pushes module to device."
             dependsOn(zipTask)
             commandLine("adb", "push", zipTask.get().archiveFile.get().asFile, "/data/local/tmp")
         }
 
         tasks.register<Exec>("installMagisk${capitalized}") {
-            group = "ForgeMint Module Installation"
+            group = "ForgeStore Module Installation"
             description = "Installs module via Magisk."
-            dependsOn(zipTask)
+            dependsOn(pushTask)
             commandLine("adb", "shell", "su", "-c", "magisk --install-module /data/local/tmp/$zipFileName")
+        }
+
+        tasks.register<Exec>("installKernelSU${capitalized}") {
+            group = "ForgeStore Module Installation"
+            description = "Installs module via KernelSU."
+            dependsOn(pushTask)
+            commandLine("adb", "shell", "su", "-c", "ksud module install /data/local/tmp/$zipFileName")
         }
     }
 }

@@ -1,10 +1,10 @@
-# ForgeMint
+# ForgeStore
 
 A Simple Forge of KeyStore
 
 ## Configuration
 
-Work dir: `/data/adb/forgemint/` — created on install. All files hot-reloaded on change.
+Work dir: `/data/adb/forgestore/` — created on install. All files hot-reloaded on change.
 
 ### 1. target.txt — Package modes
 

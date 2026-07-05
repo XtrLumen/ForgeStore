@@ -1,5 +1,12 @@
-plugins {
-    alias(libs.plugins.android.application) apply false
-    alias(libs.plugins.android.library) apply false
-    alias(libs.plugins.kotlin.android) apply false
-}
+val verName by extra("v0.1.0")
+val verType by extra("")
+val verCode by extra(
+    providers.exec {
+        commandLine("git", "rev-list", "HEAD", "--count")
+    }.standardOutput.asText.get().trim().toInt()
+)
+val verHash by extra(
+    providers.exec {
+        commandLine("git", "rev-parse", "--verify", "--short", "HEAD")
+    }.standardOutput.asText.get().trim()
+)

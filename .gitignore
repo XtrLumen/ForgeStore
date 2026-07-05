@@ -1,7 +1,9 @@
-.gradle/
-build/
-local.properties
-.idea/
+build
+target
+.idea
+.gradle
+.kotlin
+/local.properties
 *.iml
 *.iws
 *.ipr
