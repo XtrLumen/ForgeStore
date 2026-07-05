@@ -111,13 +111,15 @@ object GeneratedKeyPersistence {
         }
     }
 
-    fun loadAll(): List<LoadedKey> {
+    fun loadAll(securityLevel: Int): List<LoadedKey> {
         val dir = File(DIR)
         if (!dir.exists() || !dir.isDirectory) return emptyList()
         val result = mutableListOf<LoadedKey>()
         for (file in dir.listFiles() ?: emptyArray()) {
             if (file.extension != "tmp") {
-                load(file)?.let { result.add(it) }
+                load(file)?.let {
+                    if (it.securityLevel == securityLevel) result.add(it)
+                }
             }
         }
         return result
@@ -195,6 +197,12 @@ object GeneratedKeyPersistence {
     fun remove(uid: Int, alias: String) {
         val file = File(DIR, filename(uid, alias))
         if (file.exists()) file.delete()
+    }
+
+    fun rePersist(entry: StateManager.KeyEntry) {
+        try {
+            store(entry)
+        } catch (_: Exception) {}
     }
 
     private fun filename(uid: Int, alias: String): String {

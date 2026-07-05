@@ -193,12 +193,6 @@ object App {
     private fun registerKeystore2(ksBinder: IBinder, backdoor: IBinder) {
         val ksService = IKeystoreService.Stub.asInterface(ksBinder)
 
-        val ksInterceptor = Keystore2Interceptor()
-        BinderInterceptor.register(backdoor, ksBinder, ksInterceptor)
-        Logger.i("Registered Keystore2Interceptor")
-
-        StateManager.loadPersistedKeys(ksService)
-
         val teeBinder = try {
             ksService.getSecurityLevel(SecurityLevel.TRUSTED_ENVIRONMENT).asBinder()
         } catch (e: Exception) {
@@ -208,17 +202,31 @@ object App {
         Logger.d("Got IKeystoreSecurityLevel for TEE")
         teeBinder.linkToDeath({ onServiceDeath() }, 0)
 
-        val kmInterceptor = KeyMintInterceptor(teeBinder, SecurityLevel.TRUSTED_ENVIRONMENT)
-        BinderInterceptor.register(backdoor, teeBinder, kmInterceptor)
-        Logger.i("Registered KeyMintInterceptor for TEE")
+        val teeKm = KeyMintInterceptor(teeBinder, SecurityLevel.TRUSTED_ENVIRONMENT)
+        teeKm.loadPersistedKeys(ksService)
 
+        var sbKm: KeyMintInterceptor? = null
         try {
             val sbBinder = ksService.getSecurityLevel(SecurityLevel.STRONGBOX).asBinder()
-            val sbInterceptor = KeyMintInterceptor(sbBinder, SecurityLevel.STRONGBOX)
-            BinderInterceptor.register(backdoor, sbBinder, sbInterceptor)
-            Logger.i("Registered KeyMintInterceptor for StrongBox")
+            sbKm = KeyMintInterceptor(sbBinder, SecurityLevel.STRONGBOX)
+            sbKm.loadPersistedKeys(ksService)
         } catch (_: Exception) {
             Logger.w("StrongBox not available, skipping")
+        }
+
+        val ksInterceptor = Keystore2Interceptor(teeKm, sbKm)
+        BinderInterceptor.register(backdoor, ksBinder, ksInterceptor)
+        Logger.i("Registered Keystore2Interceptor")
+
+        BinderInterceptor.register(backdoor, teeBinder, teeKm)
+        Logger.i("Registered KeyMintInterceptor for TEE")
+
+        if (sbKm != null) {
+            try {
+                val sbBinder = ksService.getSecurityLevel(SecurityLevel.STRONGBOX).asBinder()
+                BinderInterceptor.register(backdoor, sbBinder, sbKm)
+                Logger.i("Registered KeyMintInterceptor for StrongBox")
+            } catch (_: Exception) {}
         }
     }
 

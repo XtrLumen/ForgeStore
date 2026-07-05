@@ -25,10 +25,17 @@ import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
 import android.system.keystore2.KeyMetadata
+import java.security.cert.Certificate
 
-class Keystore2Interceptor : BinderInterceptor() {
+class Keystore2Interceptor(
+    private val teeInterceptor: KeyMintInterceptor,
+    private val strongBoxInterceptor: KeyMintInterceptor?,
+) : BinderInterceptor() {
 
     private val batchParams = java.util.concurrent.ConcurrentHashMap<Long, String?>()
+    private val deletedSoftwareKeys = java.util.Collections.synchronizedSet(
+        mutableSetOf<StateManager.KeyIdentifier>()
+    )
 
     override fun onPreTransact(
         txId: Long,
@@ -78,7 +85,7 @@ class Keystore2Interceptor : BinderInterceptor() {
         try {
             data.enforceInterface(IKeystoreService.DESCRIPTOR)
             val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
-            val entry = StateManager.lookupByNspace(uid, descriptor.nspace)
+            val entry = findEntryByNspace(uid, descriptor.nspace)
                 ?: return TransactionResult.ContinueAndSkipPost
 
             val publicCert = data.createByteArray()
@@ -90,6 +97,9 @@ class Keystore2Interceptor : BinderInterceptor() {
 
             val reply = Parcel.obtain()
             reply.writeNoException()
+
+            GeneratedKeyPersistence.rePersist(entry)
+
             return TransactionResult.OverrideReply(reply)
         } catch (_: Exception) {}
         return TransactionResult.ContinueAndSkipPost
@@ -136,7 +146,7 @@ class Keystore2Interceptor : BinderInterceptor() {
             if (descriptor.domain == Domain.KEY_ID) {
                 val metadataResult = handleGetKeyEntryByMetadata(descriptor, uid)
                 if (metadataResult != null) return metadataResult
-                val teeResp = StateManager.lookupTeeResponse(uid, descriptor.nspace)
+                val teeResp = findTeeResponse(uid, descriptor.nspace)
                 if (teeResp != null) {
                     val reply = Parcel.obtain()
                     reply.writeNoException()
@@ -145,9 +155,9 @@ class Keystore2Interceptor : BinderInterceptor() {
                 }
             }
 
-            val entry = descriptor.alias?.let { StateManager.lookup(uid, it) }
+            val entry = descriptor.alias?.let { findEntry(uid, it) }
                 ?: if (descriptor.domain == Domain.KEY_ID)
-                    StateManager.lookupByNspace(uid, descriptor.nspace)
+                    findEntryByNspace(uid, descriptor.nspace)
                 else null
 
             if (entry == null) return TransactionResult.Continue
@@ -179,7 +189,7 @@ class Keystore2Interceptor : BinderInterceptor() {
             return TransactionResult.ContinueAndSkipPost
         }
 
-        val entry = StateManager.lookup(grantResult.uid, grantResult.alias)
+        val entry = findEntry(grantResult.uid, grantResult.alias)
         if (entry != null) {
             val accessVector = StateManager.getGrantAccessVector(descriptor.nspace) ?: 0
             if ((accessVector and 0x4) == 0) {
@@ -188,7 +198,7 @@ class Keystore2Interceptor : BinderInterceptor() {
             return buildGetKeyEntryResponse(entry)
         }
 
-        val teeResp = StateManager.lookupTeeResponse(grantResult.uid, descriptor.nspace)
+        val teeResp = findTeeResponse(grantResult.uid, descriptor.nspace)
         if (teeResp != null) {
             val accessVector = StateManager.getGrantAccessVector(descriptor.nspace) ?: 0
             if ((accessVector and 0x4) == 0) {
@@ -204,7 +214,7 @@ class Keystore2Interceptor : BinderInterceptor() {
     }
 
     private fun handleGetKeyEntryByMetadata(descriptor: KeyDescriptor, uid: Int): TransactionResult? {
-        val metadata = StateManager.lookupMetadataByNspace(uid, descriptor.nspace) ?: return null
+        val metadata = findMetadataByNspace(uid, descriptor.nspace) ?: return null
         val response = KeyEntryResponse().apply {
             this.metadata = metadata
             iSecurityLevel = null
@@ -222,9 +232,9 @@ class Keystore2Interceptor : BinderInterceptor() {
             val granteeUid = data.readInt()
             val accessVector = data.readInt()
 
-            val entry = keyDescriptor.alias?.let { StateManager.lookup(uid, it) }
+            val entry = keyDescriptor.alias?.let { findEntry(uid, it) }
                 ?: if (keyDescriptor.domain == Domain.KEY_ID)
-                    StateManager.lookupByNspace(uid, keyDescriptor.nspace)
+                    findEntryByNspace(uid, keyDescriptor.nspace)
                 else null
 
             if (entry == null) return TransactionResult.ContinueAndSkipPost
@@ -257,9 +267,9 @@ class Keystore2Interceptor : BinderInterceptor() {
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
             val granteeUid = data.readInt()
 
-            val entry = keyDescriptor.alias?.let { StateManager.lookup(uid, it) }
+            val entry = keyDescriptor.alias?.let { findEntry(uid, it) }
                 ?: if (keyDescriptor.domain == Domain.KEY_ID)
-                    StateManager.lookupByNspace(uid, keyDescriptor.nspace)
+                    findEntryByNspace(uid, keyDescriptor.nspace)
                 else null
 
             if (entry == null) return TransactionResult.ContinueAndSkipPost
@@ -307,13 +317,19 @@ class Keystore2Interceptor : BinderInterceptor() {
             val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
             val alias = descriptor.alias
                 ?: if (descriptor.domain == Domain.KEY_ID)
-                    StateManager.lookupByNspace(uid, descriptor.nspace)?.alias
+                    findEntryByNspace(uid, descriptor.nspace)?.alias
                 else null
             if (alias == null) return TransactionResult.Continue
 
-            if (StateManager.lookup(uid, alias) != null) {
+            val entry = findEntry(uid, alias)
+            if (entry != null) {
+                val keyId = StateManager.KeyIdentifier(uid, alias)
                 Logger.d("deleteKey alias=$alias UID=$uid → cleaning up")
-                StateManager.remove(uid, alias)
+                val owningInterceptor = findOwningInterceptor(keyId)
+                if (owningInterceptor != null) {
+                    KeyMintInterceptor.cleanupKeyData(owningInterceptor, keyId)
+                }
+                deletedSoftwareKeys.add(keyId)
                 val reply = Parcel.obtain()
                 reply.writeNoException()
                 return TransactionResult.OverrideReply(reply)
@@ -344,6 +360,11 @@ class Keystore2Interceptor : BinderInterceptor() {
                 return TransactionResult.Skip
             }
 
+            if (!ConfigManager.shouldPatch(uid)) {
+                Logger.d("getKeyEntry POST: not patching (shouldPatch=false) uid=$uid")
+                return TransactionResult.Skip
+            }
+
             if (parsedParams.isAttestKey) {
                 return handleAttestKeyOverride(uid, keyDescriptor, response, parsedParams)
             }
@@ -359,16 +380,19 @@ class Keystore2Interceptor : BinderInterceptor() {
                 StateManager.KeyIdentifier(uid, alias)
             }
 
-            val patchedChain: Array<java.security.cert.Certificate>
+            val patchedChain: Array<Certificate>
             if (keyId != null) {
-                val cached = StateManager.getPatchedChain(keyId)
+                val cached = strongBoxInterceptor?.let {
+                    KeyMintInterceptor.getPatchedChain(it, keyId)
+                } ?: KeyMintInterceptor.getPatchedChain(teeInterceptor, keyId)
                 if (cached != null) {
                     Logger.d("getKeyEntry POST: using cached patched chain for alias=${keyDescriptor.alias}")
                     patchedChain = cached
                 } else {
                     Logger.d("getKeyEntry POST: live patching chain for alias=${keyDescriptor.alias}")
                     patchedChain = AttestationPatcher.patchCertificateChain(originalChain, uid)
-                    StateManager.cachePatchedChain(keyId, patchedChain)
+                    val targetInterceptor = interceptorForSecurityLevel(response.metadata.keySecurityLevel)
+                    targetInterceptor.patchedChains[keyId] = patchedChain
                 }
             } else {
                 Logger.d("getKeyEntry POST: live patching chain (anonymous descriptor)")
@@ -411,6 +435,7 @@ class Keystore2Interceptor : BinderInterceptor() {
         key.nspace = java.security.SecureRandom().nextLong()
 
         val alias = keyDescriptor.alias ?: return TransactionResult.Skip
+        val keyId = StateManager.KeyIdentifier(uid, alias)
         val entry = StateManager.KeyEntry(
             uid = uid,
             alias = alias,
@@ -421,7 +446,9 @@ class Keystore2Interceptor : BinderInterceptor() {
             securityLevelBinder = response.iSecurityLevel ?: return TransactionResult.Skip,
             certChain = chain.map { it as java.security.cert.X509Certificate },
         )
-        StateManager.store(entry)
+        val targetInterceptor = interceptorForSecurityLevel(response.metadata.keySecurityLevel)
+        targetInterceptor.generatedKeys["${keyId.uid}:${keyId.alias}"] = entry
+        GeneratedKeyPersistence.store(entry)
         Logger.d("Stored attest key override alias=$alias nspace=${key.nspace}")
 
         val override = Parcel.obtain()
@@ -449,7 +476,7 @@ class Keystore2Interceptor : BinderInterceptor() {
                 kd.alias?.let { existing.putIfAbsent(it, kd) }
             }
 
-            val generated = StateManager.listForUid(uid)
+            val generated = listEntriesForUid(uid)
                 .filter { startPastAlias == null || it.alias > startPastAlias }
                 .take(100)
             for (gk in generated) {
@@ -478,7 +505,7 @@ class Keystore2Interceptor : BinderInterceptor() {
         try {
             reply.readException()
             val halCount = reply.readInt()
-            val generatedCount = StateManager.listForUid(uid).size
+            val generatedCount = countEntriesForUid(uid)
             val total = halCount + generatedCount
             Logger.d("getNumberOfEntries UID=$uid hal=$halCount generated=$generatedCount total=$total")
 
@@ -502,6 +529,66 @@ class Keystore2Interceptor : BinderInterceptor() {
             val packages = pm.getPackagesForUid(uid)?.toList() ?: emptyList()
             packages.any { it == "com.google.android.gms" }
         } catch (_: Exception) { false }
+    }
+
+    private fun findEntry(uid: Int, alias: String): StateManager.KeyEntry? {
+        return teeInterceptor.generatedKeys.values.find { it.uid == uid && it.alias == alias }
+            ?: strongBoxInterceptor?.generatedKeys?.values?.find { it.uid == uid && it.alias == alias }
+    }
+
+    private fun findEntryByNspace(uid: Int, nspace: Long): StateManager.KeyEntry? {
+        val entry = KeyMintInterceptor.findGeneratedKeyByKeyId(teeInterceptor, uid, nspace)
+        if (entry != null) return entry
+        if (strongBoxInterceptor != null) {
+            return KeyMintInterceptor.findGeneratedKeyByKeyId(strongBoxInterceptor, uid, nspace)
+        }
+        return null
+    }
+
+    private fun findTeeResponse(uid: Int, nspace: Long?): KeyEntryResponse? {
+        val resp = KeyMintInterceptor.findTeeResponseByKeyId(teeInterceptor, uid, nspace)
+        if (resp != null) return resp
+        if (strongBoxInterceptor != null) {
+            return KeyMintInterceptor.findTeeResponseByKeyId(strongBoxInterceptor, uid, nspace)
+        }
+        return null
+    }
+
+    private fun findMetadataByNspace(uid: Int, nspace: Long): KeyMetadata? {
+        fun tryFind(interceptor: KeyMintInterceptor): KeyMetadata? {
+            val entryKey = interceptor.nspaceToAlias["$uid:$nspace"]
+            if (entryKey != null) return interceptor.metadataCache["$uid:$entryKey"]
+            return interceptor.metadataCache.values.find {
+                it.key?.nspace == nspace && it.key?.domain == Domain.KEY_ID
+            }
+        }
+        return tryFind(teeInterceptor)
+            ?: strongBoxInterceptor?.let { tryFind(it) }
+    }
+
+    private fun listEntriesForUid(uid: Int): List<StateManager.KeyEntry> {
+        val entries = teeInterceptor.generatedKeys.values.filter { it.uid == uid }.toMutableList()
+        strongBoxInterceptor?.generatedKeys?.values?.filter { it.uid == uid }?.let { entries.addAll(it) }
+        return entries
+    }
+
+    private fun countEntriesForUid(uid: Int): Int {
+        return teeInterceptor.generatedKeys.values.count { it.uid == uid } +
+            (strongBoxInterceptor?.generatedKeys?.values?.count { it.uid == uid } ?: 0)
+    }
+
+    private fun findOwningInterceptor(keyId: StateManager.KeyIdentifier): KeyMintInterceptor? {
+        if (KeyMintInterceptor.ownsKeyResponse(teeInterceptor, keyId)) return teeInterceptor
+        if (strongBoxInterceptor != null && KeyMintInterceptor.ownsKeyResponse(strongBoxInterceptor, keyId)) return strongBoxInterceptor
+        return null
+    }
+
+    private fun interceptorForSecurityLevel(securityLevel: Int): KeyMintInterceptor {
+        return if (strongBoxInterceptor != null &&
+            securityLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX)
+            strongBoxInterceptor
+        else
+            teeInterceptor
     }
 
     companion object {

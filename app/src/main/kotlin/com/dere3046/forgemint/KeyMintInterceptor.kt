@@ -22,7 +22,6 @@ import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyParameterValue
 import android.hardware.security.keymint.SecurityLevel
 import android.hardware.security.keymint.Tag
-import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
 import android.system.keystore2.Authorization
@@ -30,16 +29,51 @@ import android.system.keystore2.CreateOperationResponse
 import android.system.keystore2.Domain
 import android.system.keystore2.IKeystoreSecurityLevel
 import android.system.keystore2.KeyDescriptor
+import android.system.keystore2.KeyEntryResponse
 import android.system.keystore2.KeyMetadata
 import java.security.SecureRandom
+import java.security.cert.Certificate
 import java.security.cert.X509Certificate
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 
 class KeyMintInterceptor(
-    private val originalBinder: IBinder,
-    private val securityLevel: Int,
+    internal val originalBinder: IBinder,
+    val securityLevel: Int,
 ) : BinderInterceptor() {
 
-    private val recentStrongBoxOps = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.ConcurrentLinkedDeque<Long>>()
+    val generatedKeys = ConcurrentHashMap<String, StateManager.KeyEntry>()
+    val teeResponses = ConcurrentHashMap<StateManager.KeyIdentifier, KeyEntryResponse>()
+    val patchedChains = ConcurrentHashMap<StateManager.KeyIdentifier, Array<Certificate>>()
+    val attestationKeys = ConcurrentHashMap.newKeySet<StateManager.KeyIdentifier>()
+    val importedKeys = ConcurrentHashMap.newKeySet<StateManager.KeyIdentifier>()
+    val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
+    val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
+    val nspaceToAlias = ConcurrentHashMap<String, String>()
+    val metadataCache = ConcurrentHashMap<String, KeyMetadata>()
+
+    fun loadPersistedKeys(ksService: android.system.keystore2.IKeystoreService) {
+        var count = 0
+        for (lk in GeneratedKeyPersistence.loadAll(securityLevel)) {
+            if (lk.metadata == null) continue
+            val binder = try {
+                ksService.getSecurityLevel(lk.securityLevel)
+            } catch (_: Exception) { null }
+            generatedKeys[key(lk.uid, lk.alias)] = StateManager.KeyEntry(
+                uid = lk.uid,
+                alias = lk.alias,
+                nspace = lk.nspace,
+                metadata = lk.metadata,
+                keyPair = lk.keyPair,
+                secretKey = lk.secretKey,
+                securityLevel = lk.securityLevel,
+                securityLevelBinder = binder,
+                certChain = lk.certChain,
+            )
+            count++
+        }
+        if (count > 0) Logger.d("Loaded $count persisted keys (secLevel=$securityLevel)")
+    }
 
     private fun enforceStrongBoxLimitThenContinue(uid: Int): TransactionResult {
         val isSb = securityLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX
@@ -47,7 +81,7 @@ class KeyMintInterceptor(
         if (!isSb) {
             return TransactionResult.Continue
         }
-        val timestamps = recentStrongBoxOps.computeIfAbsent(uid) { java.util.concurrent.ConcurrentLinkedDeque() }
+        val timestamps = recentOps.computeIfAbsent(uid) { ConcurrentLinkedDeque() }
         val cutoff = System.nanoTime() - 10_000_000_000L
         timestamps.removeIf { it < cutoff }
         if (timestamps.size >= 4) {
@@ -167,16 +201,22 @@ class KeyMintInterceptor(
 
             val originalChain = CertificateHelper.getCertificateChain(metadata)
             if (originalChain == null || originalChain.size <= 1) {
-                StateManager.cacheMetadataSnapshot(keyId, metadata)
-                val levelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
-                StateManager.cacheTeeResponse(keyId, metadata, levelBinder)
+                cacheMetadataSnapshot(keyId, metadata)
+                val levelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
+                teeResponses[keyId] = KeyEntryResponse().apply {
+                    this.metadata = metadata
+                    iSecurityLevel = levelBinder
+                }
                 Logger.d("Cached teeResponse for non-attested/null-chain key alias=${keyDescriptor.alias}")
                 return TransactionResult.Skip
             }
 
             if (!ConfigManager.shouldPatch(callingUid)) {
-                val levelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
-                StateManager.cacheTeeResponse(keyId, metadata, levelBinder)
+                val levelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
+                teeResponses[keyId] = KeyEntryResponse().apply {
+                    this.metadata = metadata
+                    iSecurityLevel = levelBinder
+                }
                 Logger.d("Cached teeResponse for HAL key (non-patch) alias=${keyDescriptor.alias} uid=$callingUid chainSize=${originalChain.size}")
                 return TransactionResult.Skip
             }
@@ -184,10 +224,13 @@ class KeyMintInterceptor(
             Logger.d("PATCH mode post-generateKey for UID=$callingUid")
             val patchedChain = AttestationPatcher.patchCertificateChain(originalChain, callingUid)
 
-            StateManager.cachePatchedChain(keyId, patchedChain)
-            val levelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
-            StateManager.cacheTeeResponse(keyId, metadata, levelBinder)
-            StateManager.cacheMetadataSnapshot(keyId, metadata)
+            patchedChains[keyId] = patchedChain
+            val levelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
+            teeResponses[keyId] = KeyEntryResponse().apply {
+                this.metadata = metadata
+                iSecurityLevel = levelBinder
+            }
+            cacheMetadataSnapshot(keyId, metadata)
             Logger.d("Cached patched chain + teeResponse for alias=${keyDescriptor.alias}")
 
             CertificateHelper.updateCertificateChain(callingUid, metadata, patchedChain)
@@ -250,9 +293,9 @@ class KeyMintInterceptor(
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Skip
             val alias = keyDescriptor.alias ?: return TransactionResult.Skip
             val keyId = StateManager.KeyIdentifier(uid, alias)
-            if (StateManager.lookup(uid, alias) != null) {
+            if (generatedKeys.containsKey(key(keyId.uid, keyId.alias))) {
                 Logger.d("importKey alias=$alias UID=$uid → cleaning up generated key")
-                StateManager.remove(uid, alias)
+                cleanupKeyData(this, keyId)
             }
 
             if (!ConfigManager.shouldPatch(uid)) return TransactionResult.Skip
@@ -266,9 +309,12 @@ class KeyMintInterceptor(
                     val newChain = AttestationPatcher.patchCertificateChain(originalChain, uid)
                     CertificateHelper.updateCertificateChain(uid, metadata, newChain).getOrThrow()
                     metadata.authorizations = AttestationPatcher.patchAuthorizations(metadata.authorizations, uid)
-                    StateManager.cachePatchedChain(keyId, newChain)
-                    val levelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
-                    StateManager.cacheTeeResponse(keyId, metadata, levelBinder)
+                    patchedChains[keyId] = newChain
+                    val levelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder)
+                    teeResponses[keyId] = KeyEntryResponse().apply {
+                        this.metadata = metadata
+                        iSecurityLevel = levelBinder
+                    }
                     Logger.d("Cached patched chain + teeResponse for imported key alias=$alias")
 
                     val override = Parcel.obtain()
@@ -295,7 +341,7 @@ class KeyMintInterceptor(
             data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return TransactionResult.Continue
 
-            val entry = StateManager.lookupByAliasOrDomain(uid, keyDescriptor)
+            val entry = lookupByAliasOrDomain(uid, keyDescriptor)
                 ?: return enforceStrongBoxLimitThenContinue(uid)
 
             val params = data.createTypedArray(KeyParameter.CREATOR) ?: return TransactionResult.Continue
@@ -324,13 +370,13 @@ class KeyMintInterceptor(
 
             val operation = SoftwareOperation(txId, entry.keyPair, entry.secretKey, parsedParams, securityLevel, uid)
             if (securityLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX &&
-                StateManager.countActiveOps(uid) >= StateManager.getOpLimit(securityLevel)) {
-                Logger.w("createOperation: StrongBox op limit reached uid=$uid active=${StateManager.countActiveOps(uid)}")
+                countActiveOps(uid) >= getOpLimit(securityLevel)) {
+                Logger.w("createOperation: StrongBox op limit reached uid=$uid active=${countActiveOps(uid)}")
                 return replyKeymintError(-29) ?: TransactionResult.Skip
             }
-            StateManager.acquireOp(uid, operation, securityLevel)
+            acquireOp(uid, operation, securityLevel)
             val binder = SoftwareOperationBinder(operation)
-            val response = android.system.keystore2.CreateOperationResponse().apply {
+            val response = CreateOperationResponse().apply {
                 iOperation = binder
                 operationChallenge = null
                 parameters = operation.beginParameters
@@ -476,11 +522,53 @@ class KeyMintInterceptor(
             reply.setDataPosition(savedPos)
             return hasEx
         }
+
+        fun findGeneratedKeyByKeyId(interceptor: KeyMintInterceptor, uid: Int, nspace: Long?): StateManager.KeyEntry? {
+            if (nspace == null || nspace == 0L) return null
+            return interceptor.generatedKeys.values.find { it.uid == uid && it.nspace == nspace }
+        }
+
+        fun findTeeResponseByKeyId(interceptor: KeyMintInterceptor, uid: Int, nspace: Long?): KeyEntryResponse? {
+            if (nspace == null || nspace == 0L) return null
+            return interceptor.teeResponses.entries.find { it.key.uid == uid && it.value.metadata?.key?.nspace == nspace }?.value
+        }
+
+        fun getGeneratedKeyResponse(interceptor: KeyMintInterceptor, keyId: StateManager.KeyIdentifier): KeyEntryResponse? {
+            val entry = interceptor.generatedKeys["${keyId.uid}:${keyId.alias}"] ?: return null
+            val binder = entry.securityLevelBinder ?: return null
+            return KeyEntryResponse().apply {
+                metadata = entry.metadata
+                iSecurityLevel = binder
+            }
+        }
+
+        fun ownsKeyResponse(interceptor: KeyMintInterceptor, keyId: StateManager.KeyIdentifier): Boolean {
+            return interceptor.generatedKeys.containsKey("${keyId.uid}:${keyId.alias}") || interceptor.teeResponses.containsKey(keyId)
+        }
+
+        fun cleanupKeyData(interceptor: KeyMintInterceptor, keyId: StateManager.KeyIdentifier) {
+            purgeGrantsForKey(interceptor, keyId)
+            if (interceptor.generatedKeys.remove("${keyId.uid}:${keyId.alias}") != null) GeneratedKeyPersistence.remove(keyId.uid, keyId.alias)
+            interceptor.teeResponses.remove(keyId)
+            interceptor.patchedChains.remove(keyId)
+            interceptor.attestationKeys.remove(keyId)
+            interceptor.importedKeys.remove(keyId)
+        }
+
+        fun purgeGrantsForKey(interceptor: KeyMintInterceptor, keyId: StateManager.KeyIdentifier) {
+            StateManager.purgeGrants(keyId)
+        }
+
+        fun getPatchedChain(interceptor: KeyMintInterceptor, keyId: StateManager.KeyIdentifier): Array<Certificate>? {
+            return interceptor.patchedChains[keyId]
+        }
     }
 
+    private fun key(uid: Int, alias: String) = "$uid:$alias"
+
     private fun isKnownAttestationKey(uid: Int, descriptor: KeyDescriptor): Boolean {
-        return StateManager.lookupByNspace(uid, descriptor.nspace) != null ||
-            (descriptor.alias != null && StateManager.lookup(uid, descriptor.alias) != null)
+        return generatedKeys.values.find { it.uid == uid && it.nspace == descriptor.nspace } != null ||
+            (descriptor.alias != null && generatedKeys[key(uid, descriptor.alias)] != null)
     }
 
     private fun replyKeymintError(errorCode: Int): TransactionResult? {
@@ -534,8 +622,8 @@ class KeyMintInterceptor(
 
         val keybox = KeyboxReader.loadKeybox(params.algorithm)
         val attestEntry: StateManager.KeyEntry? = if (attestKeyDescriptor != null) {
-            val entry = attestKeyDescriptor.alias?.let { StateManager.lookup(uid, it) }
-                ?: StateManager.lookupByNspace(uid, attestKeyDescriptor.nspace)
+            val entry = attestKeyDescriptor.alias?.let { generatedKeys[key(uid, it)] }
+                ?: generatedKeys.values.find { it.uid == uid && it.nspace == attestKeyDescriptor.nspace }
             if (entry == null) {
                 Logger.w("GenKeyFailed: attest key not found " +
                     "alias=${attestKeyDescriptor.alias} nspace=${attestKeyDescriptor.nspace}")
@@ -597,16 +685,18 @@ class KeyMintInterceptor(
             normalized
         }
 
-        StateManager.store(StateManager.KeyEntry(
+        val kId = key(uid, originalDescriptor.alias ?: "")
+        generatedKeys[kId] = StateManager.KeyEntry(
             uid = uid,
             alias = originalDescriptor.alias ?: "",
             nspace = nspace,
             metadata = metadata,
             keyPair = keyPair,
             securityLevel = securityLevel,
-            securityLevelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder),
+            securityLevelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder),
             certChain = chain.map { it as X509Certificate },
-        ))
+        )
+        GeneratedKeyPersistence.store(generatedKeys[kId]!!)
 
         val override = Parcel.obtain()
         override.writeNoException()
@@ -669,16 +759,18 @@ class KeyMintInterceptor(
             normalized
         }
 
-        StateManager.store(StateManager.KeyEntry(
+        val kId = key(uid, descriptor.alias ?: "")
+        generatedKeys[kId] = StateManager.KeyEntry(
             uid = uid,
             alias = descriptor.alias ?: "",
             nspace = nspace,
             metadata = metadata,
             keyPair = keyPair,
             securityLevel = securityLevel,
-            securityLevelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder),
+            securityLevelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder),
             certChain = chain.map { it as X509Certificate },
-        ))
+        )
+        GeneratedKeyPersistence.store(generatedKeys[kId]!!)
 
         val override = Parcel.obtain()
         override.writeNoException()
@@ -733,7 +825,8 @@ class KeyMintInterceptor(
             normalized
         }
 
-        StateManager.store(StateManager.KeyEntry(
+        val kId = key(uid, descriptor.alias ?: "")
+        generatedKeys[kId] = StateManager.KeyEntry(
             uid = uid,
             alias = descriptor.alias ?: "",
             nspace = nspace,
@@ -741,9 +834,10 @@ class KeyMintInterceptor(
             keyPair = null,
             secretKey = secretKey,
             securityLevel = securityLevel,
-            securityLevelBinder = android.system.keystore2.IKeystoreSecurityLevel.Stub.asInterface(originalBinder),
+            securityLevelBinder = IKeystoreSecurityLevel.Stub.asInterface(originalBinder),
             certChain = emptyList(),
-        ))
+        )
+        GeneratedKeyPersistence.store(generatedKeys[kId]!!)
 
         val override = Parcel.obtain()
         override.writeNoException()
@@ -752,5 +846,47 @@ class KeyMintInterceptor(
         TeeLatencySimulator.simulateGenerateKeyDelay(params.algorithm, securityLevel, System.nanoTime() - startNanos)
 
         return TransactionResult.OverrideReply(override)
+    }
+
+    private fun countActiveOps(uid: Int): Int = activeOps[uid]?.count { !it.finalized } ?: 0
+
+    private fun getOpLimit(secLevel: Int): Int =
+        if (secLevel == android.hardware.security.keymint.SecurityLevel.STRONGBOX) 4 else 15
+
+    private fun acquireOp(uid: Int, operation: SoftwareOperation, secLevel: Int) {
+        val maxOps = getOpLimit(secLevel)
+        val ops = activeOps.computeIfAbsent(uid) { ConcurrentLinkedDeque() }
+        ops.removeIf { it.finalized }
+        while (ops.size >= maxOps) {
+            val oldest = ops.pollFirst() ?: break
+            if (!oldest.finalized) {
+                Logger.w("LRU: aborting oldest unfinished op for uid=$uid (active=${ops.size}/$maxOps)")
+                oldest.abort()
+            }
+        }
+        ops.addLast(operation)
+    }
+
+    private fun lookupByAliasOrDomain(uid: Int, descriptor: KeyDescriptor): StateManager.KeyEntry? {
+        return when (descriptor.domain) {
+            Domain.KEY_ID -> generatedKeys.values.find { it.uid == uid && it.nspace == descriptor.nspace }
+            Domain.APP -> descriptor.alias?.let { generatedKeys[key(uid, it)] }
+            else -> null
+        }
+    }
+
+    private fun cacheMetadataSnapshot(keyId: StateManager.KeyIdentifier, metadata: KeyMetadata) {
+        val nspace = metadata.key?.nspace ?: return
+        metadataCache[key(keyId.uid, keyId.alias)] = metadata
+        nspaceToAlias[key(uid = keyId.uid, alias = nspace.toString())] = keyId.alias
+        Logger.d("Cached metadata snapshot for ${keyId.alias} nspace=$nspace")
+    }
+
+    private fun lookupMetadataByNspace(uid: Int, nspace: Long): KeyMetadata? {
+        val entryKey = nspaceToAlias[key(uid, nspace.toString())]
+            ?: return metadataCache.values.find {
+                it.key?.nspace == nspace && it.key?.domain == Domain.KEY_ID
+            }
+        return metadataCache[key(uid, entryKey)]
     }
 }

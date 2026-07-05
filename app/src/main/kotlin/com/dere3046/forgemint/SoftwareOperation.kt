@@ -314,7 +314,6 @@ class SoftwareOperation(
         } finally {
             if (finalized) {
                 applyLatency(start)
-                StateManager.releaseOp(uid)
             }
         }
     }
@@ -323,7 +322,6 @@ class SoftwareOperation(
         if (finalized) return
         finalized = true
         primitive.abort()
-        StateManager.releaseOp(uid)
         Logger.d("SoftwareOperation abort txId=$txId")
     }
 

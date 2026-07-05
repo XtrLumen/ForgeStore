@@ -262,7 +262,6 @@ object ConfigManager {
                 if (path == KEYBOX_FILE) {
                     Logger.i("keybox.xml changed, clearing caches")
                     KeyboxReader.clearCache()
-                    StateManager.clearAll()
                 }
                 if (path == CONFIG_FILE) {
                     Logger.i("config changed, reloading")
