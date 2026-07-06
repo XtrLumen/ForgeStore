@@ -40,9 +40,6 @@ android {
     }
 
     buildTypes {
-        debug {
-            versionNameSuffix = "-d"
-        }
         release {
             isMinifyEnabled = true
             vcsInfo.include = false
